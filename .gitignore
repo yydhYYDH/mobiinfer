@@ -463,3 +463,6 @@ claude_chat.txt
 # ignore temp scripts
 /extract_llm_*.py
 test_analyze_nonlinear.py
+
+# oneday scoder
+.oneday/

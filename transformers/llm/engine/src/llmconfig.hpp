@@ -218,6 +218,8 @@ public:
         return config_.value("reuse_kv", false);
     }
 
+    bool prompt_cache() const { return config_.value("prompt_cache", false); }
+
     bool all_logits() const {
         return config_.value("all_logits", false);
     }
@@ -291,6 +293,8 @@ public:
         return config_.value("talker_speaker", "Chelsie");
     }
 
+    bool interleaved() const { return config_.value("interleaved", false); }
+
     int dit_steps() const {
         return config_.value("dit_steps", 5);
     }
@@ -330,6 +334,30 @@ public:
         return config_.value("has_deepstack", false);
     }
 
+    bool has_ple() const {
+        return config_.find("ple_embed_file") != config_.end();
+    }
+
+    std::string ple_embed_file() const {
+        return base_dir_ + config_.value("ple_embed_file", "");
+    }
+
+    float ple_embed_scale() const {
+        return config_.value("ple_embed_scale", 1.0f);
+    }
+
+    int ple_embed_dim() const {
+        return config_.value("ple_embed_dim", 0);
+    }
+
+    std::vector<int64_t> ple_quant() const {
+        return config_.value("ple_quant", std::vector<int64_t>{});
+    }
+
+    float attn_scale() const {
+        return config_.value("attn_scale", 0.0f);
+    }
+
     bool use_template() const {
         return config_.value("use_template", true);
     }
@@ -339,6 +367,9 @@ public:
     }
     bool use_cached_mmap() const {
         return config_.value("use_cached_mmap", true);
+    }
+    int mmap_size() const {
+        return config_.value("mmap_size", 1024);
     }
     int dynamic_option() const {
         return config_.value("dynamic_option", 0);

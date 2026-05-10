@@ -33,6 +33,7 @@ public:
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
     void gated_delta_rule_ref(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs);
     void gated_delta_rule_mnn(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs);
+    void gated_delta_rule_decode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) const;
     void short_conv(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs);
 private:
     std::string mAttentionType;
@@ -43,6 +44,8 @@ private:
     bool mUseQKL2Norm;
     int mBytes;  // 4 for fp32, 2 for fp16 (Arm82)
     std::shared_ptr<StateCache> mStateCache;
+    KVMeta* mMeta;
+    std::string mPrefixCacheDir;
 
     // Temporary buffers for MNN-optimized path (per-Execution, DYNAMIC)
     std::shared_ptr<Tensor> mConvPadded;         // Padded conv input:  [B, D, convStateSize + L]
