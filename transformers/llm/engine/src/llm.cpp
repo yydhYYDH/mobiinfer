@@ -27,6 +27,7 @@
 
 // 0: no debug, 1: test op time, 2: print tensor info, 3: print tensor in output
 #define DEBUG_MODE 0
+// #define DBG_DEEPSTACK
 //#define DEBUG_IMAGE
 
 namespace MNN {
@@ -60,6 +61,10 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
         return MNN_FORWARD_VULKAN;
     if (type_str == "npu")
         return MNN_FORWARD_NN;
+    if (type_str == "hiai")
+        return MNN_FORWARD_USER_0;
+    if (type_str == "hiai_delegate")
+        return MNN_FORWARD_USER_1;
     return MNN_FORWARD_AUTO;
 }
 
@@ -131,7 +136,7 @@ void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCall
     mExecutor->setCallBack(std::move(before), std::move(after));
 }
 
-void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg) {
+void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg, bool enable_kv_hints) {
     rtg->setHint(MNN::Interpreter::INIT_THREAD_NUMBER, 4);
 
     rtg->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);
@@ -140,9 +145,10 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     int legacyAttentionMode = mConfig->config_.value("quant_qkv", 8); // compatibility
     int attentionMode = mConfig->config_.value("attention_mode", legacyAttentionMode); // try to read 'attention_mode'
 
-    // 3. 设置 Hint
+    // 3. Configure attention-related hints. For vision-only runtimes we can
+    // disable KV-related hinting to avoid accidental decoder-style behavior.
     rtg->setHint(MNN::Interpreter::ATTENTION_OPTION, attentionMode);
-    if (mConfig->reuse_kv() && attentionMode == 10) {
+    if (enable_kv_hints && mConfig->reuse_kv() && attentionMode == 10) {
         rtg->setHint(MNN::Interpreter::ATTENTION_OPTION, 9);
     }
     if (mConfig->use_cached_mmap()) {
@@ -161,7 +167,7 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     rtg->setExternalPath(mConfig->npu_model_dir(), MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
     rtg->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, mConfig->config_.value("dynamic_option", 0));
 
-    rtg->setHintPtr(Interpreter::KVCACHE_INFO, mMeta.get());
+    rtg->setHintPtr(Interpreter::KVCACHE_INFO, enable_kv_hints ? mMeta.get() : nullptr);
     if (backend_type_convert(mConfig->backend_type()) != 0) { // not cpu
         std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";
         rtg->setCache(cacheFilePath + "/mnn_cachefile.bin");
@@ -337,6 +343,29 @@ bool Llm::load() {
         }
         return false;
     }
+#ifdef DBG_DEEPSTACK
+    // Dump baked input shapes from the loaded LLM module so we can compare them
+    // against runtime mExtraArgs shapes. Compile with -DDBG_DEEPSTACK to enable.
+    {
+        auto info = mModule->getInfo();
+        if (info != nullptr) {
+            printf("[DBG_DEEPSTACK] LLM module loaded with %zu inputs, %zu outputs\n",
+                   info->inputNames.size(), info->outputNames.size());
+            fflush(stdout);
+            for (size_t i = 0; i < info->inputNames.size(); ++i) {
+                std::string s = "[";
+                for (size_t d = 0; d < info->inputs[i].dim.size(); ++d) {
+                    s += std::to_string(info->inputs[i].dim[d]);
+                    if (d + 1 < info->inputs[i].dim.size()) s += ",";
+                }
+                s += "]";
+                printf("[DBG_DEEPSTACK]   in[%zu] %s baked_shape=%s\n",
+                       i, info->inputNames[i].c_str(), s.c_str());
+                fflush(stdout);
+            }
+        }
+    }
+#endif
     // set speculative decoding params
     setSpeculativeConfig();
     // create generation strategy
@@ -521,7 +550,31 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     mGenerateParam->validLogitStart = 0;
     std::vector<Express::VARP> inputs {hiddenState, mask, inputPos, logitsIndex};
     inputs.insert(inputs.end(), extraArgs.begin(), extraArgs.end());
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] Llm::forwardRaw before onForward: inputs=%zu seqLen=%d seqLenKey=%d inDecode=%d isAllLogists=%d mMeta->add=%d all_seq_len=%d gen_seq_len=%d\n",
+           inputs.size(), (int)seqLen, (int)seqLenKey, (int)inDecode, (int)isAllLogists,
+           (int)mMeta->add, (int)mContext->all_seq_len, (int)mContext->gen_seq_len);
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        auto raw = inputs[i].get();
+        auto info = raw ? raw->getInfo() : nullptr;
+        std::string s = info ? "[" : "<null>";
+        if (info) {
+            for (size_t d = 0; d < info->dim.size(); ++d) {
+                s += std::to_string(info->dim[d]);
+                if (d + 1 < info->dim.size()) s += ",";
+            }
+            s += "]";
+        }
+        printf("[DBG_DEEPSTACK]   Llm.in[%zu] shape=%s ptr=%p\n",
+               i, s.c_str(), (void*)raw);
+    }
+    fflush(stdout);
+#endif
     std::vector<Express::VARP> outputs = selectModule->onForward(inputs);
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] Llm::forwardRaw after onForward: outputs=%zu\n", outputs.size());
+    fflush(stdout);
+#endif
 
     if (outputs.empty()) {
         mContext->status = LlmStatus::INTERNAL_ERROR;
@@ -629,6 +682,11 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
     MNN::Express::ExecutorScope s(mExecutor);
     
     int seq_len         = input_embeds->getInfo()->dim[mSeqLenIndex];
+    // Reset chunk window. Set per-chunk inside the loops below; default -1
+    // signals "not chunked" so Omni::forwardRaw passes mExtraArgs through
+    // unchanged (correct for single-shot prefill and pure decode).
+    mChunkStart = -1;
+    mChunkSize  = 0;
     if (0 == mBlockSize) {
         mMeta->add = seq_len;
         auto attention_mask = gen_attention_mask(seq_len);
@@ -665,8 +723,13 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         auto embed = embeddings[i];
         auto attention_mask = gen_attention_mask(blockSize);
         auto position_ids = gen_position_ids(blockSize);
+        // Tell forwardRaw which slice of the full mExtraArgs (deepstack) goes
+        // with this chunk so QNN's [3, blockSize, H] baked input matches.
+        mChunkStart = i * blockSize;
+        mChunkSize  = blockSize;
         logits = forwardRaw(embed, attention_mask, position_ids);
         if(logits.empty()) {
+            mChunkStart = -1;
             return logits;
         }
         updateContext(blockSize, 0);
@@ -699,19 +762,72 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         }
         auto attention_mask = gen_attention_mask(forwardSize);
         auto position_ids = gen_position_ids(forwardSize);
+        // Tail chunk follows the completed blockNumber * blockSize tokens.
+        // Set mChunkSize = forwardSize (already padded to a baked-graph shape)
+        // so the deepstack slice matches; mChunkStart = absolute offset.
+        // For pure decode (single-token), runtime is gen_seq_len > 0 so this
+        // path may be hit with forwardSize == 1; mChunkSize == 1 is still
+        // correct -- Omni::forwardRaw will simply pass through [3,1,H].
+        mChunkStart = blockNumber * blockSize;
+        mChunkSize  = forwardSize;
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] forwardVec: about to call remainder forwardRaw chunk[%d:%d] forwardSize=%d hasPad=%d blockRemain=%d\n",
+               mChunkStart, mChunkStart + mChunkSize, forwardSize, (int)hasPad, blockRemain);
+        fflush(stdout);
+#endif
         logits = forwardRaw(input_embeds, attention_mask, position_ids);
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] forwardVec: remainder forwardRaw returned, logits.size=%zu\n", logits.size());
+        fflush(stdout);
+#endif
         if(logits.empty()) {
+            mChunkStart = -1;
             return logits;
         }
     }
+    mChunkStart = -1;
+    mChunkSize  = 0;
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] forwardVec: post-loop, calling updateContext(-%d, 0); blockNumber=%d blockSize=%d hasPad=%d addSize=%d\n",
+           blockSize * blockNumber, blockNumber, blockSize, (int)hasPad, addSize);
+    fflush(stdout);
+#endif
     updateContext(-blockSize * blockNumber, 0);
     if (hasPad) {
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] forwardVec: hasPad path, logits[0] ptr=%p\n", (void*)logits[0].get());
+        fflush(stdout);
+        if (logits[0].get() != nullptr) {
+            auto info = logits[0]->getInfo();
+            if (info) {
+                std::string s = "[";
+                for (size_t d = 0; d < info->dim.size(); ++d) {
+                    s += std::to_string(info->dim[d]);
+                    if (d + 1 < info->dim.size()) s += ",";
+                }
+                s += "]";
+                printf("[DBG_DEEPSTACK]   logits[0] shape=%s\n", s.c_str());
+                fflush(stdout);
+            } else {
+                printf("[DBG_DEEPSTACK]   logits[0] info=NULL\n");
+                fflush(stdout);
+            }
+        }
+#endif
         auto logitSize = logits[0]->getInfo()->dim[2];
         // encode
         mGenerateParam->validLogitStart = ((int)addSize - 1) * logitSize;
         mGenerateParam->validLogitSize = logitSize;
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] forwardVec: hasPad path done, validLogitStart=%d validLogitSize=%d\n",
+               mGenerateParam->validLogitStart, mGenerateParam->validLogitSize);
+        fflush(stdout);
+#endif
     }
-
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] forwardVec: returning logits.size=%zu\n", logits.size());
+    fflush(stdout);
+#endif
     return logits;
 }
 
@@ -722,12 +838,48 @@ void Llm::updateContext(int seq_len, int gen_len) {
 
 int Llm::sample(VARP logits, int offset, int size) {
     MNN::Express::ExecutorScope s(mExecutor);
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] sample: enter offset=%d size=%d logits_ptr=%p\n",
+           offset, size, (void*)logits.get());
+    fflush(stdout);
+#endif
     auto logitsShape = logits->getInfo()->dim;
+#ifdef DBG_DEEPSTACK
+    {
+        std::string s = "[";
+        for (size_t d = 0; d < logitsShape.size(); ++d) {
+            s += std::to_string(logitsShape[d]);
+            if (d + 1 < logitsShape.size()) s += ",";
+        }
+        s += "]";
+        printf("[DBG_DEEPSTACK] sample: logits shape=%s total_elements=%zu\n",
+               s.c_str(), logits->getInfo()->size);
+        fflush(stdout);
+    }
+#endif
     if (offset && size) {
         MNN_ASSERT(logits->getInfo()->size >= offset + size);
-        logits = _Const(logits->readMap<float>() + offset, {size}, NHWC, halide_type_of<float>());
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] sample: about to readMap and slice [%d:%d]\n",
+               offset, offset + size);
+        fflush(stdout);
+#endif
+        auto raw = logits->readMap<float>();
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] sample: readMap returned %p\n", (void*)raw);
+        fflush(stdout);
+#endif
+        logits = _Const(raw + offset, {size}, NHWC, halide_type_of<float>());
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] sample: sliced logits ptr=%p\n", (void*)logits.get());
+        fflush(stdout);
+#endif
     }
     auto token_id = mSampler->sample(logits);
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] sample: token_id=%d\n", token_id);
+    fflush(stdout);
+#endif
     return token_id;
 }
 
@@ -850,7 +1002,16 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
 
     mContext->history_tokens.insert(mContext->history_tokens.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
     if(!passExecute) {
-        if (0 == mBlockSize || input_ids.size() <= mBlockSize) {
+        // For visual/audio (Omni) input, the outer chunking below would call
+        // embedding(chunk_ids) once per outer chunk. Omni::embedding consumes
+        // mVisionEmbeddings[vision_idx++] in one shot for ALL image_pads in the
+        // chunk and clears mVisionEmbeddings at the end of the call -- so the
+        // 2nd outer chunk that still contains image_pads will hit empty
+        // mVisionEmbeddings and segfault. Skip the outer chunking entirely for
+        // multimodal, embed the whole input_ids once, and rely on
+        // forwardVec's inner chunked-prefill to honor mBlockSize.
+        const bool isMultimodal = mConfig->is_visual() || mConfig->is_audio();
+        if (0 == mBlockSize || input_ids.size() <= mBlockSize || isMultimodal) {
             auto hidden_states = embedding(input_ids);
             if(hidden_states == nullptr) {
                 return {};
@@ -922,13 +1083,72 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
 
     Timer _t;
     auto outputs = forwardVec(input_embeds);
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] generate(VARP): forwardVec returned, outputs.size=%zu mGenerateParam->outputs.size=%zu validLogitStart=%d validLogitSize=%d\n",
+           outputs.size(), mGenerateParam->outputs.size(),
+           mGenerateParam->validLogitStart, mGenerateParam->validLogitSize);
+    fflush(stdout);
+#endif
     if(mGenerateParam->outputs.size() < 1) {
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return {};
     }
+#ifdef DBG_DEEPSTACK
+    {
+        auto o0 = mGenerateParam->outputs[0];
+        auto info = o0.get() ? o0->getInfo() : nullptr;
+        printf("[DBG_DEEPSTACK] generate(VARP): mGenerateParam->outputs[0] ptr=%p info=%p\n",
+               (void*)o0.get(), (void*)info);
+        fflush(stdout);
+        if (info) {
+            std::string s = "[";
+            for (size_t d = 0; d < info->dim.size(); ++d) {
+                s += std::to_string(info->dim[d]);
+                if (d + 1 < info->dim.size()) s += ",";
+            }
+            s += "]";
+            printf("[DBG_DEEPSTACK]   shape=%s total_elements=%zu\n", s.c_str(), info->size);
+            fflush(stdout);
+        }
+    }
+#endif
     updateContext(seqLen, 0);
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] generate(VARP): after updateContext(seqLen=%d, 0); all_seq_len=%d\n",
+           seqLen, mContext->all_seq_len);
+    fflush(stdout);
+#endif
     mContext->prefill_us += _t.durationInUs();
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] generate(VARP): before gc(); outputs[0]_use_count=?\n");
+    fflush(stdout);
+#endif
     MNN::Express::ExecutorScope::Current()->gc(); // after prefill
+#ifdef DBG_DEEPSTACK
+    printf("[DBG_DEEPSTACK] generate(VARP): after gc()\n");
+    fflush(stdout);
+    {
+        auto o0 = mGenerateParam->outputs.empty() ? nullptr : mGenerateParam->outputs[0].get();
+        printf("[DBG_DEEPSTACK] generate(VARP): post-gc outputs[0]=%p mGenerateParam=%p mGenerationStrategy=%p max_tokens=%d\n",
+               (void*)o0, (void*)mGenerateParam.get(), (void*)mGenerationStrategy.get(), max_tokens);
+        fflush(stdout);
+        if (o0) {
+            auto info = ((MNN::Express::Variable*)o0)->getInfo();
+            printf("[DBG_DEEPSTACK] generate(VARP): post-gc outputs[0] info=%p\n", (void*)info);
+            fflush(stdout);
+            if (info) {
+                std::string s = "[";
+                for (size_t d = 0; d < info->dim.size(); ++d) {
+                    s += std::to_string(info->dim[d]);
+                    if (d + 1 < info->dim.size()) s += ",";
+                }
+                s += "]";
+                printf("[DBG_DEEPSTACK] generate(VARP): post-gc outputs[0] shape=%s size=%zu\n", s.c_str(), info->size);
+                fflush(stdout);
+            }
+        }
+    }
+#endif
 
     // prefix cache mode and response second time
     if(mPrefixCacheMode && mCallIndex == 2) {
@@ -973,7 +1193,16 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
     // call generation function
     if (0 < max_tokens) {
         mGenerateParam->max_new_tokens = max_tokens;
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] generate(VARP): about to call mGenerationStrategy->generate(); strategy=%p\n",
+               (void*)mGenerationStrategy.get());
+        fflush(stdout);
+#endif
         mGenerationStrategy->generate(*mGenerateParam);
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] generate(VARP): mGenerationStrategy->generate() returned\n");
+        fflush(stdout);
+#endif
     }
     return mContext->output_tokens;
 }
@@ -1004,7 +1233,7 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
             prompt = user_content;
         }
     }
-    std::cout << "prompt: " << prompt << std::endl;
+    // std::cout << "prompt: " << prompt << std::endl;
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
@@ -1204,7 +1433,10 @@ VARP Llm::gen_attention_mask(int seq_len) {
             for (int i = 0; i < seq_len; i++) {
                 for (int j = 0; j < kv_seq_len; j++) {
                     int row              = i + mContext->all_seq_len;
-                    ptr[seq_len * i + j] = is_glm2 ? j > row : j <= row;
+                    // printf("row: %d, col: %d\n", row, j);
+                    // ptr[seq_len * i + j] = is_glm2 ? j > row : j <= row;
+                    // DAHU
+                    ptr[kv_seq_len * i + j] = is_glm2 ? j > row : j <= row;
                 }
             }
         }

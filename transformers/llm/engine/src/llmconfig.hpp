@@ -135,6 +135,63 @@ public:
         return base_dir_ + config_.value("visual_model", "visual.mnn");
     }
 
+    bool visual_split() const {
+        return config_.value("visual_split", false);
+    }
+
+    std::string visual_pre_model() const {
+        return base_dir_ + config_.value("visual_pre_model", "visual_pre.mnn");
+    }
+
+    std::string visual_blocks_model() const {
+        return base_dir_ + config_.value("visual_blocks_model", "visual_blocks.mnn");
+    }
+
+    // Optional NPU/CPU sub-split of the blocks module (temporary NPU test mode).
+    // visual_npu_layers() > 0 signals: load visual_blocks_npu_model() (first N
+    // layers) onto the NPU runtime and visual_blocks_cpu_model() (remaining
+    // layers) onto the CPU runtime, then chain them at runtime. When
+    // visual_npu_layers() == 0 (default) the monolithic visual_blocks_model()
+    // path is used and the two extra getters are not consulted.
+    int visual_npu_layers() const {
+        return config_.value("visual_npu_layers", 0);
+    }
+    std::string visual_blocks_npu_model() const {
+        return base_dir_ + config_.value("visual_blocks_npu_model", "visual_blocks_npu.mnn");
+    }
+    std::string visual_blocks_cpu_model() const {
+        return base_dir_ + config_.value("visual_blocks_cpu_model", "visual_blocks_cpu.mnn");
+    }
+
+    // K-chunk NPU split (new, takes priority over visual_npu_layers when present).
+    // When the config contains "visual_blocks_chunks": [name0, name1, ...], each
+    // entry is a .mnn file holding a roughly-equal slice of the visual blocks.
+    // All chunks run on the NPU runtime and are chained at inference time, so
+    // each HiAI IR-build handles O(1/K) weights — avoids OOM on the monolithic
+    // build. Returns absolute paths (base_dir_ prepended); empty vector = disabled.
+    std::vector<std::string> visual_blocks_chunks() const {
+        std::vector<std::string> out;
+        if (!config_.contains("visual_blocks_chunks")) return out;
+        auto arr = config_["visual_blocks_chunks"];
+        if (!arr.is_array()) return out;
+        out.reserve(arr.size());
+        for (size_t i = 0; i < arr.size(); i++) {
+            auto item = arr[i];
+            if (item.is_string()) {
+                out.push_back(base_dir_ + item.get<std::string>());
+            }
+        }
+        return out;
+    }
+
+    std::string visual_post_model() const {
+        return base_dir_ + config_.value("visual_post_model", "visual_post.mnn");
+    }
+
+    std::string visual_blocks_backend_type() const {
+        return config_.value("visual_blocks_backend_type", "hiai");
+    }
+
     std::string npu_model_dir() const {
         return base_dir_ + config_.value("npu_model_dir", "");
     }

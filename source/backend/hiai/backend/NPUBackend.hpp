@@ -9,6 +9,28 @@
 #ifndef MNN_NPUBACKEND_H
 #define MNN_NPUBACKEND_H
 
+#ifndef MNN_HIAI_USE_LOCAL_NPU_FIXES
+#define MNN_HIAI_USE_LOCAL_NPU_FIXES 1
+#endif
+
+// Enable chunk-aware OM cache:
+//   - Save/read OM as "<npu_model_dir>/chunk_i/vision.om" when runtime passes
+//     per-chunk EXTERNAL_NPU_FILE_DIR.
+//   - Set to 0 to keep legacy behavior.
+#ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
+#define MNN_HIAI_CACHE_OM_BY_CHUNK 0
+#endif
+
+// Enable freeing the host-side memory of CONSTANT input tensors (weights / biases)
+// after they have been copied into HiAI Const ops during graph build. This shrinks
+// peak RAM during multi-chunk NPU model load, at the cost of requiring every
+// consumer op to call NPUBackend::consumeConst exactly as many times as
+// addConstRef was called.
+//
+// Comment out (or pass -DMNN_HIAI_FREE_CONST_HOST=0) to keep the legacy behaviour
+// of retaining host weights across the lifetime of the session.
+#define MNN_HIAI_FREE_CONST_HOST 1
+
 #include <graph/attr_value.h>
 #include <graph/operator_hiai_reg.h>
 #include <graph/op/all_ops.h>
@@ -26,8 +48,42 @@
 
 #include <stdio.h>
 #include <map>
+#include <chrono>
 #include <memory>
 #include <core/TensorUtils.hpp>
+
+// Toggle verbose NPU backend logging at compile time. Pass -DHIAI_VERBOSE=1 or
+// flip the default below to 1 to print each stage of NPU graph construction,
+// IR build, model load, tensor IO, and per-op execute. Use it to triage
+// whether a failure is:
+//   (a) op-type not-supported  -> "[NPU] Don't support type ..." in onCreate
+//   (b) per-op setup failure   -> "[HIAI_V] <op> onResize ..." shows which
+//                                  execution returned an error before IR build
+//   (c) graph build failure    -> BuildIRModel failed with stage trace
+//   (d) model load failure     -> LoadModelSync returned null
+//   (e) IO dimension mismatch  -> GetModelIOTensorDim failed or shape mismatch
+//   (f) execute failure        -> Process returned non-zero
+#ifndef HIAI_VERBOSE
+#define HIAI_VERBOSE 0
+#endif
+
+#ifndef HIAI_VERBOSE_V2
+#define HIAI_VERBOSE_V2 0
+#endif
+
+#if HIAI_VERBOSE
+#define MNN_HIAI_LOG(fmt, ...) \
+    do { printf("[HIAI_V] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while (0)
+#else
+#define MNN_HIAI_LOG(fmt, ...) do {} while (0)
+#endif
+
+#if HIAI_VERBOSE_V2
+#define MNN_HIAI_LOGV2(fmt, ...) \
+    do { printf("[HIAI_V] " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while (0)
+#else
+#define MNN_HIAI_LOGV2(fmt, ...) do {} while (0)
+#endif
 
 #ifdef HIAI_DEBUG
 #include <android/trace.h>
@@ -328,6 +384,31 @@ namespace MNN {
 
         map<int, int> mSclipMap;
         map<unsigned long, int> mInputMap;
+
+#if MNN_HIAI_USE_LOCAL_NPU_FIXES
+        // Tracks (inputIndex, MNN tensor ptr, byte size) for each network-input
+        // Data op created in setNetworkInput. Used in getInOutTensorInfo to
+        // rebuild mInputMap by matching MNN input sizes to HiAI's actual input
+        // ordering (which may differ from allocation order for multi-input ops).
+        struct InputOrderEntry { int inputIndex; unsigned long tensorPtr; size_t byteSize; };
+        std::vector<InputOrderEntry> mInputOrder;
+#endif
+
+        // Added for Memory Optimization
+        std::map<const Tensor*, int> mConstRefCounts;
+        std::set<const Tensor*> mKeepConsts;
+        void consumeConst(const Tensor* tensor);
+        void addConstRef(const Tensor* tensor);
+
+        // For Data inputs with rank > 4 that had unit dims squeezed so the HiAI
+        // Data op stays within the 4-D DDK limit, this maps inputIndex -> list
+        // of dim positions that were removed. Consumers (e.g. NPUGatherV2 applied
+        // to a squeezed rotary_pos_emb) look here to translate axes/shapes from
+        // the MNN view back to the squeezed HiAI view.
+        map<int, std::vector<int>> mInputSqueezedAxes;
+        int attentionOptionHint() const {
+            return (mNPURuntime != nullptr) ? mNPURuntime->hint().attentionOption : -1;
+        }
     public:
         class Creator {
         public:
@@ -350,6 +431,9 @@ namespace MNN {
         MNNTensorList mMNNOutTensors;
         const NPURuntime* mNPURuntime;
         BackendConfig::PrecisionMode mPrecision;
+#if HIAI_VERBOSE
+        std::chrono::steady_clock::time_point mResizeTimerStart;
+#endif
 
 #ifdef HIAI_DEBUG
         void *(*ATrace_beginSection) (const char* sectionName);

@@ -107,6 +107,7 @@ class LlmExporter(torch.nn.Module):
 
         # tie word embeddings
         self.args.tie_word_embeddings = not self.args.seperate_embed and self.model.lm.lm.weight.equal(self.model.embed.embed.weight)
+        print(f'tie_word_embeddings: {self.args.tie_word_embeddings}')
         # Pass properties from model to exporter
         self.visual = self.model.visual
         self.audio = self.model.audio
@@ -139,12 +140,33 @@ class LlmExporter(torch.nn.Module):
         seq_len = input_ids.numel()
         new_tokens = 0
 
+        first_print = True
+        
         while new_tokens < self.max_new_tokens:
             attention_mask = self.model.get_attention_mask(seq_len, new_tokens)
             position_ids = self.model.get_position_ids(seq_len, new_tokens, input_ids)
             input_embeds = self.model.embedding(input_ids)
             deepstack_embeds = self.model.visual.deepstacks() if self.model.visual is not None else None
-
+            
+            if first_print == True:
+                first_print = False
+                print(f'seq_len: {seq_len}, new_tokens: {new_tokens}')
+                print(f'position_ids')
+                print(position_ids.size())
+                print(f'input_embeds')
+                print(input_embeds.size())
+                
+            # print(f'seq_len: {seq_len}, new_tokens: {new_tokens}')
+            # print(f'position_ids')
+            # print(position_ids.size())
+            # print(f'input_embeds')
+            # print(input_embeds.size())
+            # with open('debug.txt', 'w') as f:
+            #     f.write(f'seq_len: {seq_len}, new_tokens: {new_tokens}\n')
+            #     f.write(f'position_ids: {position_ids}\n')
+            #     f.write(f'input_embeds: {input_embeds.size()}\n')
+            #     f.write(f'input_ids_size: {input_ids.size()}\n')
+            #     f.write(f'input_ids: {input_ids}\n')
             logits, _, _ = self.model.forward(
                 input_ids=input_embeds,
                 attention_mask=attention_mask,
@@ -164,6 +186,7 @@ class LlmExporter(torch.nn.Module):
             word = self.tokenizer.id_to_str(token_id)
             print(word, end="", flush=True)
             input_ids = token_id
+        print("seq_len: ", seq_len)
 
         if hasattr(self.model, 'talker') and self.model.talker is not None:
             self.model.talker.generate()
@@ -302,6 +325,47 @@ class LlmExporter(torch.nn.Module):
                     "precision": "normal",
                     "memory": "low"
                 }
+            if getattr(self.args, 'visual_split', False):
+                config['visual_split'] = True
+                config['visual_pre_model'] = 'visual_pre.mnn'
+                config['visual_blocks_model'] = 'visual_blocks.mnn'
+                config['visual_post_model'] = 'visual_post.mnn'
+                config['visual_blocks_backend_type'] = 'hiai'
+                # K-chunk NPU split (new): populates visual_blocks_chunks list.
+                # Takes priority over legacy --visual_npu_layers.
+                npu_chunks = int(getattr(self.args, 'visual_npu_chunks', 0) or 0)
+                if npu_chunks > 0:
+                    config['visual_blocks_chunks'] = [
+                        f'visual_blocks_npu_{ci}.mnn' for ci in range(npu_chunks)
+                    ]
+                    # Optional per-chunk backend routing for runtime mixed execution.
+                    # Example: --visual_chunk_backends "npu,cpu,npu,cpu"
+                    # Defaults to all-NPU if absent.
+                    chunk_backends = str(getattr(self.args, 'visual_chunk_backends', '') or '').strip()
+                    if chunk_backends:
+                        tokens = [t.strip().lower() for t in chunk_backends.split(',') if t.strip()]
+                        if len(tokens) != npu_chunks:
+                            raise ValueError(
+                                f"--visual_chunk_backends length ({len(tokens)}) must equal "
+                                f"--visual_npu_chunks ({npu_chunks})")
+                        normalized = []
+                        for t in tokens:
+                            if t in ('npu', 'hiai'):
+                                normalized.append('npu')
+                            elif t == 'cpu':
+                                normalized.append('cpu')
+                            else:
+                                raise ValueError(
+                                    f"--visual_chunk_backends only supports cpu/npu (got '{t}')")
+                        config['visual_blocks_chunk_backends'] = normalized
+                # Optional NPU/CPU sub-split for the blocks module (legacy 2-chunk).
+                # Only added when the user opts in via --visual_npu_layers N > 0
+                # AND --visual_npu_chunks is not set. Absent fields mean "use the
+                # monolithic visual_blocks.mnn above".
+                elif getattr(self.args, 'visual_npu_layers', 0) > 0:
+                    config['visual_npu_layers'] = int(self.args.visual_npu_layers)
+                    config['visual_blocks_npu_model'] = 'visual_blocks_npu.mnn'
+                    config['visual_blocks_cpu_model'] = 'visual_blocks_cpu.mnn'
             if self.args.eagle_path is not None:
                 config['speculative_type'] = 'eagle'
                 config['hidden_states'] = True
@@ -483,9 +547,412 @@ class LlmExporter(torch.nn.Module):
         self.smooth_quantizer = SmoothQuantizer(model = self.model, max_calib_samples = calib_samples, act_bit=self.args.act_bit, act_sym=self.args.act_sym, generate_for_npu=self.args.generate_for_npu)
         self.smooth_quantizer.quantize()
 
+    def _build_visual_split_wrappers(self):
+        """Wrap self.visual into 3 torch.nn.Modules (pre / blocks / post) that share
+        its weights. Each wrapper handles Qwen2Vision / Qwen3_5Vision / Qwen3Vision
+        variants by probing attributes on the underlying instance.
+
+        Returns (pre, blocks, post, meta) where meta is a dict describing I/O
+        names, dummy shapes and whether deepstack is enabled. The wrappers run
+        exactly the same sub-computation as self.visual.forward, so per-block
+        GPTQ indices and weight naming are preserved across the 3 ONNX files.
+        """
+        visual = self.visual
+        has_pos_embed = hasattr(visual, 'pos_embed') and visual.pos_embed is not None
+        has_deepstack = (hasattr(visual, 'deepstack_visual_indexes')
+                         and visual.deepstack_visual_indexes is not None
+                         and len(visual.deepstack_visual_indexes) > 0
+                         and hasattr(visual, 'deepstack_merger_list'))
+        unsqueeze_output = hasattr(visual, 'num_grid_per_side')  # Qwen3_5Vision / Qwen3Vision
+
+        class _VisualPre(torch.nn.Module):
+            def __init__(self, vis):
+                super().__init__()
+                self.rotary = vis.rotary
+                self.patch_embed = vis.patch_embed
+                if has_pos_embed:
+                    self.pos_embed = vis.pos_embed
+
+            def forward(self, flatten_patches, position_ids, idx_tensor=None, weight_tensor=None):
+                rotary_pos_emb = self.rotary(position_ids)
+                hidden_states = self.patch_embed(flatten_patches)
+                if has_pos_embed:
+                    pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(2)
+                    pos_embeds = torch.sum(pos_embeds, 0, False)
+                    hidden_states = hidden_states + pos_embeds
+                if rotary_pos_emb.dtype != hidden_states.dtype:
+                    rotary_pos_emb = rotary_pos_emb.to(hidden_states.dtype)
+                return hidden_states, rotary_pos_emb
+
+        class _VisualBlocks(torch.nn.Module):
+            def __init__(self, vis):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList(vis.blocks)
+                if has_deepstack:
+                    self.deepstack_visual_indexes = list(vis.deepstack_visual_indexes)
+
+            def forward(self, hidden_states, rotary_pos_emb, attention_mask):
+                deepstack_hidden = []
+                for layer_num, blk in enumerate(self.blocks):
+                    hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb,
+                                        attention_mask=attention_mask)
+                    if has_deepstack and layer_num in self.deepstack_visual_indexes:
+                        deepstack_hidden.append(hidden_states)
+                if has_deepstack:
+                    return (hidden_states, *deepstack_hidden)
+                return hidden_states
+
+        class _VisualPost(torch.nn.Module):
+            def __init__(self, vis):
+                super().__init__()
+                self.merger = vis.merger
+                if has_deepstack:
+                    self.deepstack_merger_list = torch.nn.ModuleList(vis.deepstack_merger_list)
+
+            def forward(self, hidden_states, *deepstack_hidden):
+                if has_deepstack:
+                    feats = [m(h) for m, h in zip(self.deepstack_merger_list, deepstack_hidden)]
+                    deepstack_feature = torch.stack(feats)
+                image_embeds = self.merger(hidden_states)
+                if unsqueeze_output:
+                    image_embeds = image_embeds.unsqueeze(1)
+                if has_deepstack:
+                    return image_embeds, deepstack_feature
+                return image_embeds
+
+        # Choose dummy shapes. Prefer the same ones used by visual.export().
+        if has_pos_embed:
+            seq_len = 256
+            patches_dim = 1536
+            rotary_feat = seq_len  # rotary_pos_emb leading dim equals seq_len
+        else:
+            seq_len = 256
+            patches_dim = 1176  # Qwen2Vision default patch dim; rarely used in split mode
+            rotary_feat = seq_len
+
+        meta = {
+            'has_pos_embed': has_pos_embed,
+            'has_deepstack': has_deepstack,
+            'unsqueeze_output': unsqueeze_output,
+            'seq_len': seq_len,
+            'patches_dim': patches_dim,
+            'deepstack_indexes': list(visual.deepstack_visual_indexes) if has_deepstack else [],
+        }
+        return _VisualPre(visual), _VisualBlocks(visual), _VisualPost(visual), meta
+
+    def _build_visual_blocks_chunk(self, start_layer, end_layer, has_deepstack, deepstack_indexes):
+        """Build a torch.nn.Module wrapping visual.blocks[start_layer:end_layer].
+        Same I/O signature as _VisualBlocks (hidden_states, rotary_pos_emb, attention_mask
+        -> hidden_states [, deepstack_hidden_0, ..., deepstack_hidden_M-1]), but only
+        the deepstack layers whose GLOBAL index falls in [start_layer, end_layer) are
+        captured. This preserves original ordering when the caller concatenates outputs
+        from the NPU chunk and the CPU chunk.
+        Non-invasive: callers that don't use this stay on _VisualBlocks.
+        """
+        visual = self.visual
+        # Absolute layer index → True if that layer emits a deepstack_hidden.
+        # Filter to only indexes inside this chunk.
+        local_indexes = []
+        if has_deepstack:
+            local_indexes = [i - start_layer for i in deepstack_indexes
+                             if start_layer <= i < end_layer]
+
+        class _VisualBlocksChunk(torch.nn.Module):
+            def __init__(self, vis, s, e):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList(vis.blocks[s:e])
+                self._local_ds = list(local_indexes)
+                self._has_ds = bool(local_indexes)
+
+            def forward(self, hidden_states, rotary_pos_emb, attention_mask):
+                ds = []
+                for layer_num, blk in enumerate(self.blocks):
+                    hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb,
+                                        attention_mask=attention_mask)
+                    if self._has_ds and layer_num in self._local_ds:
+                        ds.append(hidden_states)
+                if self._has_ds:
+                    return (hidden_states, *ds)
+                return hidden_states
+
+        return _VisualBlocksChunk(visual, start_layer, end_layer), local_indexes
+
+    @torch.no_grad()
+    def export_vision_split(self):
+        """Export visual as 3 separate .mnn files: pre / blocks / post.
+
+        Intended use: run 'blocks' on NPU, pre/post on CPU. Block I/O is 3D
+        [B, S, D] so no NC4HW4 layout conversion is needed at the boundary.
+        """
+        pre, blocks, post, meta = self._build_visual_split_wrappers()
+        pre.eval(); blocks.eval(); post.eval()
+
+        def _reset_kv_cache(m):
+            # Attention modules in utils/transformers.py cache K/V in
+            # self.past_key_value across calls, which makes a dry-run double K/V
+            # seq length on the subsequent trace. Force-clear it before every
+            # forward pass we plan to export.
+            for sub in m.modules():
+                if hasattr(sub, 'past_key_value'):
+                    sub.past_key_value = None
+
+        S = meta['seq_len']
+        D_in = meta['patches_dim']
+        # Shape of hidden_states after patch_embed; we can't know D_out without a
+        # dry run, so do one now to capture it (shapes only; weights are real).
+        patches = torch.randn([S, D_in])
+        position_ids = torch.zeros([2, S], dtype=torch.int32)
+        _reset_kv_cache(pre)
+        if meta['has_pos_embed']:
+            idx_tensor = torch.zeros([4, S], dtype=torch.int32)
+            weight_tensor = torch.randn([4, S])
+            hidden_states, rotary_pos_emb = pre(patches, position_ids, idx_tensor, weight_tensor)
+        else:
+            hidden_states, rotary_pos_emb = pre(patches, position_ids)
+        # patch_embed can change the seq dim (temporal fold/unfold). Build the
+        # attention_mask from the actual hidden_states length.
+        S_out = hidden_states.shape[0] if hidden_states.dim() == 2 else hidden_states.shape[1]
+        attention_mask = torch.zeros([1, S_out, S_out], dtype=hidden_states.dtype)
+        _reset_kv_cache(blocks)
+        blocks_out = blocks(hidden_states, rotary_pos_emb, attention_mask)
+        if isinstance(blocks_out, tuple):
+            hidden_final = blocks_out[0]
+        else:
+            hidden_final = blocks_out
+
+        # --- Export pre to ONNX ---
+        pre_onnx = os.path.join(self.onnx_path, 'visual_pre.onnx')
+        _reset_kv_cache(pre)
+        if meta['has_pos_embed']:
+            onnx_export(pre,
+                        (patches, position_ids, idx_tensor, weight_tensor),
+                        pre_onnx,
+                        input_names=['patches', 'position_ids', 'idx_tensor', 'weight_tensor'],
+                        output_names=['hidden_states', 'rotary_pos_emb'],
+                        dynamic_axes={
+                            'patches': {0: 'size'},
+                            'position_ids': {1: 'size'},
+                            'idx_tensor': {1: 'size'},
+                            'weight_tensor': {1: 'size'},
+                            'hidden_states': {0: 'size'},
+                            'rotary_pos_emb': {0: 'size'},
+                        })
+        else:
+            onnx_export(pre,
+                        (patches, position_ids),
+                        pre_onnx,
+                        input_names=['patches', 'position_ids'],
+                        output_names=['hidden_states', 'rotary_pos_emb'],
+                        dynamic_axes={
+                            'patches': {0: 'size'},
+                            'position_ids': {1: 'size'},
+                            'hidden_states': {0: 'size'},
+                            'rotary_pos_emb': {0: 'size'},
+                        })
+
+        # --- Export blocks to ONNX ---
+        # When --visual_npu_layers > 0 or --visual_npu_chunks > 0 the runtime
+        # only uses the chunk files (visual_blocks_npu*.mnn [+ visual_blocks_cpu.mnn])
+        # — the monolithic visual_blocks.mnn would just be dead weight on disk AND
+        # building it through self._convert_visual_piece(...) is as memory-heavy
+        # as the thing we're trying to avoid. Skip it in that case.
+        _skip_monolithic_blocks = (
+            int(getattr(self.args, 'visual_npu_layers', 0) or 0) > 0
+            or int(getattr(self.args, 'visual_npu_chunks', 0) or 0) > 0
+        )
+        blocks_onnx = None
+        if not _skip_monolithic_blocks:
+            blocks_onnx = os.path.join(self.onnx_path, 'visual_blocks.onnx')
+            _reset_kv_cache(blocks)
+            blocks_outputs = ['hidden_states']
+            blocks_dyn = {
+                'hidden_states_in': {0: 'size'},
+                'rotary_pos_emb': {0: 'size'},
+                'attention_mask': {1: 'size', 2: 'size'},
+                'hidden_states': {0: 'size'},
+            }
+            if meta['has_deepstack']:
+                for i in range(len(meta['deepstack_indexes'])):
+                    name = f'deepstack_hidden_{i}'
+                    blocks_outputs.append(name)
+                    blocks_dyn[name] = {0: 'size'}
+            onnx_export(blocks,
+                        (hidden_states, rotary_pos_emb, attention_mask),
+                        blocks_onnx,
+                        input_names=['hidden_states_in', 'rotary_pos_emb', 'attention_mask'],
+                        output_names=blocks_outputs,
+                        dynamic_axes=blocks_dyn)
+
+        # --- Export post to ONNX ---
+        post_onnx = os.path.join(self.onnx_path, 'visual_post.onnx')
+        _reset_kv_cache(post)
+        if meta['has_deepstack']:
+            deepstack_dummy = tuple(hidden_final for _ in meta['deepstack_indexes'])
+            in_names = ['hidden_states'] + [f'deepstack_hidden_{i}' for i in range(len(meta['deepstack_indexes']))]
+            out_names = ['image_embeds', 'deepstack_feature']
+            dyn = {n: {0: 'size'} for n in in_names}
+            onnx_export(post,
+                        (hidden_final, *deepstack_dummy),
+                        post_onnx,
+                        input_names=in_names,
+                        output_names=out_names,
+                        dynamic_axes=dyn)
+        else:
+            onnx_export(post,
+                        (hidden_final,),
+                        post_onnx,
+                        input_names=['hidden_states'],
+                        output_names=['image_embeds'],
+                        dynamic_axes={'hidden_states': {0: 'size'}})
+
+        # --- Convert each piece to MNN using the selected quant path ---
+        if self.mnn_converter:
+            self._convert_visual_piece(pre_onnx)
+            if blocks_onnx is not None:
+                self._convert_visual_piece(blocks_onnx)
+            self._convert_visual_piece(post_onnx)
+
+        # --- Optional NPU chunk export of blocks ---
+        # Two activation modes (mutually exclusive; --visual_npu_chunks takes priority):
+        #
+        #  (1) --visual_npu_chunks K > 0  (new):
+        #      Split the blocks into K roughly-equal NPU chunks. Emits
+        #        visual_blocks_npu_0.mnn ... visual_blocks_npu_{K-1}.mnn
+        #      all targeting the same NPU runtime. Each chunk is O(1/K) the
+        #      weights of the monolithic module, so HiAI IR-build peak memory
+        #      scales down by K. Runtime chains them in order.
+        #
+        #  (2) --visual_npu_layers N > 0  (legacy 2-chunk):
+        #      First N layers → visual_blocks_npu.mnn (NPU),
+        #      Remaining layers → visual_blocks_cpu.mnn (CPU).
+        #      File names preserved for back-compat with existing configs.
+        #
+        # Neither set: skip entirely (the monolithic visual_blocks.mnn above is
+        # the only blocks artifact).
+        npu_chunks = int(getattr(self.args, 'visual_npu_chunks', 0) or 0)
+        npu_layers = int(getattr(self.args, 'visual_npu_layers', 0) or 0)
+        if npu_chunks > 0 or npu_layers > 0:
+            total = len(self.visual.blocks)
+
+            # Resolve chunk boundaries and per-chunk file names.
+            # Each entry is (start, end, onnx_basename, is_last_cpu_only).
+            chunk_specs = []
+            if npu_chunks > 0:
+                if npu_chunks < 2:
+                    raise ValueError(f"--visual_npu_chunks must be >= 2 (got {npu_chunks}); "
+                                     f"use --visual_npu_chunks=0 + monolithic for K=1")
+                if npu_chunks > total:
+                    raise ValueError(f"--visual_npu_chunks={npu_chunks} must be <= total blocks ({total})")
+                # Equal split with the remainder absorbed into the last chunk,
+                # so chunk sizes differ by at most 1.
+                base = total // npu_chunks
+                rem = total % npu_chunks
+                cursor = 0
+                for ci in range(npu_chunks):
+                    size = base + (1 if ci < rem else 0)
+                    s, e = cursor, cursor + size
+                    chunk_specs.append((s, e, f'visual_blocks_npu_{ci}.onnx', False))
+                    cursor = e
+                assert cursor == total
+            else:
+                # Legacy 2-chunk: NPU first-N + CPU rest. Preserve old names.
+                if npu_layers >= total:
+                    raise ValueError(f"--visual_npu_layers={npu_layers} must be < total blocks ({total})")
+                chunk_specs.append((0, npu_layers, 'visual_blocks_npu.onnx', False))
+                chunk_specs.append((npu_layers, total, 'visual_blocks_cpu.onnx', True))
+
+            # Export each chunk. Between chunks, dry-run to get the next chunk's
+            # hidden_states input. rotary_pos_emb and attention_mask are reused.
+            last_hidden = hidden_states
+            global_ds_cursor = 0
+            chunk_onnx_paths = []
+            for (s, e, fname, _is_cpu_tail) in chunk_specs:
+                chunk_module, local_ds_idx = self._build_visual_blocks_chunk(
+                    s, e, meta['has_deepstack'], meta['deepstack_indexes'])
+                chunk_module.eval()
+
+                chunk_onnx = os.path.join(self.onnx_path, fname)
+                _reset_kv_cache(chunk_module)
+                out_names = ['hidden_states']
+                dyn = {
+                    'hidden_states_in': {0: 'size'},
+                    'rotary_pos_emb': {0: 'size'},
+                    'attention_mask': {1: 'size', 2: 'size'},
+                    'hidden_states': {0: 'size'},
+                }
+                # Deepstack outputs use GLOBAL indices, matching what the post
+                # module expects (deepstack_hidden_0 .. _{M-1}). Each chunk emits
+                # only the subset whose global layer index falls in [s, e).
+                for k in range(len(local_ds_idx)):
+                    name = f'deepstack_hidden_{global_ds_cursor + k}'
+                    out_names.append(name)
+                    dyn[name] = {0: 'size'}
+                onnx_export(chunk_module,
+                            (last_hidden, rotary_pos_emb, attention_mask),
+                            chunk_onnx,
+                            input_names=['hidden_states_in', 'rotary_pos_emb', 'attention_mask'],
+                            output_names=out_names,
+                            dynamic_axes=dyn)
+                chunk_onnx_paths.append(chunk_onnx)
+
+                # Dry-run to propagate hidden_states into the next chunk.
+                # ViT blocks are shape-preserving, so this only fixes input
+                # tensor values; shapes don't drift.
+                _reset_kv_cache(chunk_module)
+                chunk_out = chunk_module(last_hidden, rotary_pos_emb, attention_mask)
+                last_hidden = chunk_out[0] if isinstance(chunk_out, tuple) else chunk_out
+                global_ds_cursor += len(local_ds_idx)
+
+            if self.mnn_converter:
+                for p in chunk_onnx_paths:
+                    self._convert_visual_piece(p)
+
+    def _convert_visual_piece(self, onnx_path):
+        """Route a single visual-split onnx file through whichever MNN conversion
+        path the user asked for (same flags as the non-split export_vision)."""
+        fuse_transformer = self.visual.transformer_fuse
+        native_group_conv = self.visual.group_conv_native
+        quant_bit_visual = self.visual.quant_bit
+        quant_block_visual = self.visual.quant_block
+        if self.args.transformer_fuse:
+            fuse_transformer = True
+        if self.args.group_conv_native:
+            native_group_conv = True
+        if self.args.visual_quant_bit is not None:
+            quant_bit_visual = self.args.visual_quant_bit
+        if self.args.visual_quant_block is not None:
+            quant_block_visual = self.args.visual_quant_block
+        if self.args.visual_keep_matmul:
+            self.mnn_converter.export_visual_fp16_matmul(
+                onnx_path,
+                transformer_fuse=fuse_transformer,
+                group_conv_native=native_group_conv,
+                weight_sym=self.args.visual_sym,
+                slim_json=not self.args.visual_json_full,
+                emit_json=not self.args.visual_no_json,
+            )
+        elif self.args.visual_gptq_path is not None:
+            self.mnn_converter.export_visual_with_gptq(
+                onnx_path,
+                self.args.visual_gptq_path,
+                quant_block=quant_block_visual if quant_block_visual else 128,
+                transformer_fuse=fuse_transformer,
+                group_conv_native=native_group_conv,
+                weight_sym=self.args.visual_sym,
+            )
+        else:
+            self.mnn_converter.export(
+                onnx_path, quant_bit_visual, quant_block_visual,
+                transformer_fuse=fuse_transformer,
+                group_conv_native=native_group_conv,
+                weight_sym=self.args.visual_sym,
+            )
+
     def export_vision(self):
         if self.visual is None:
             return
+        if getattr(self.args, 'visual_split', False):
+            return self.export_vision_split()
         vision_onnx = self.visual.export(self.onnx_path)
         if self.mnn_converter:
             fuse_transformer = self.visual.transformer_fuse
@@ -500,11 +967,33 @@ class LlmExporter(torch.nn.Module):
                 quant_bit_visual = self.args.visual_quant_bit
             if self.args.visual_quant_block is not None:
                 quant_block_visual = self.args.visual_quant_block
-            self.mnn_converter.export(vision_onnx, quant_bit_visual,
-                                      quant_block_visual,
-                                      transformer_fuse=fuse_transformer,
-                                      group_conv_native=native_group_conv,
-                                      weight_sym=self.args.visual_sym)
+            if self.args.visual_keep_matmul:
+                # fp16 + MatMul preserved (no MatMul->Conv fold). No GPTQ applied.
+                self.mnn_converter.export_visual_fp16_matmul(
+                    vision_onnx,
+                    transformer_fuse=fuse_transformer,
+                    group_conv_native=native_group_conv,
+                    weight_sym=self.args.visual_sym,
+                    slim_json=not self.args.visual_json_full,
+                    emit_json=not self.args.visual_no_json
+                )
+            elif self.args.visual_gptq_path is not None:
+                # GPTQ path: onnx2mnn(fp16) -> mnn2json -> apply visual gptq(blocks->int8) -> json2mnn
+                # merger/deepstack/patch_embed keep fp16, only blocks are replaced with GPTQ int8
+                self.mnn_converter.export_visual_with_gptq(
+                    vision_onnx,
+                    self.args.visual_gptq_path,
+                    quant_block=quant_block_visual if quant_block_visual else 128,
+                    transformer_fuse=fuse_transformer,
+                    group_conv_native=native_group_conv,
+                    weight_sym=self.args.visual_sym
+                )
+            else:
+                self.mnn_converter.export(vision_onnx, quant_bit_visual,
+                                          quant_block_visual,
+                                          transformer_fuse=fuse_transformer,
+                                          group_conv_native=native_group_conv,
+                                          weight_sym=self.args.visual_sym)
 
     def export_audio(self):
         if self.audio is None:
@@ -526,6 +1015,7 @@ class LlmExporter(torch.nn.Module):
     def export_language(self):
         # export_embedding
         if self.mnn_converter and self.args.tie_word_embeddings:
+            print("tie_word_embeddings")
             pass # mnn tie_word_embeddings need't export embedding
         else:
             self.export_embed()
@@ -559,7 +1049,7 @@ class LlmExporter(torch.nn.Module):
         self.export_mtp()
         self.export_tokenizer()
         self.export_config(export_mnn)
-        if export_mnn:
+        if export_mnn and self.args.cleanup_onnx:
             # delete onnx file
             try:
                 for file in glob.glob(f'{self.onnx_path}/*'):
@@ -682,13 +1172,14 @@ class EmbeddingExporter(LlmExporter):
             tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=transformer_fuse)
             if tie_embeddings_info is not None:
                 self.llm_config['tie_embeddings'] = tie_embeddings_info
-            # delete onnx file
-            try:
-                for file in glob.glob(f'{self.onnx_path}/*'):
-                    os.remove(file)
-                os.rmdir(self.onnx_path)
-            except Exception as e:
-                print(f"remove onnx error: {e}")
+            if self.args.cleanup_onnx:
+                # delete onnx file
+                try:
+                    for file in glob.glob(f'{self.onnx_path}/*'):
+                        os.remove(file)
+                    os.rmdir(self.onnx_path)
+                except Exception as e:
+                    print(f"remove onnx error: {e}")
 
 def build_args(parser):
     parser.add_argument('--path', type=str, required=True,
@@ -703,11 +1194,20 @@ def build_args(parser):
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
+    parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
+    parser.add_argument('--visual_keep_matmul', action='store_true', help='Export visual model as fp16 with MatMul preserved (no MatMul->Conv fold). No GPTQ applied. Overrides --visual_gptq_path.')
+    parser.add_argument('--visual_json_full', action='store_true', help='Keep full (un-slimmed) visual.mnn.json with inline weight arrays. Only effective with --visual_keep_matmul. Default: slim (strip weight arrays).')
+    parser.add_argument('--visual_no_json', action='store_true', help='Skip visual.mnn.json generation entirely (mnn2json step is memory-heavy on large fp16 models). Only effective with --visual_keep_matmul.')
+    parser.add_argument('--visual_split', action='store_true', help='Export visual model as 3 separate .mnn files (visual_pre.mnn / visual_blocks.mnn / visual_post.mnn) so blocks can run on NPU while pre/post run on CPU. Uses the same quant flags as the non-split path.')
+    parser.add_argument('--visual_npu_layers', type=int, default=0, help='[TEMPORARY NPU TEST] With --visual_split, put the first N transformer blocks into visual_blocks_npu.mnn (for NPU) and the remaining into visual_blocks_cpu.mnn (for CPU). Default 0 = disabled, existing --visual_split behaviour preserved. Non-invasive: pre/post and DeepStack merging are unchanged; merely shards the blocks wrapper so the NPU build phase is cheap to test.')
+    parser.add_argument('--visual_npu_chunks', type=int, default=0, help='With --visual_split, split the visual transformer blocks into K roughly equal NPU chunks (visual_blocks_npu_0.mnn ... visual_blocks_npu_{K-1}.mnn) so each HiAI IR-build processes only 1/K of the weights. Recommended when the monolithic build OOMs. Overrides --visual_npu_layers when > 0. Default 0 = disabled. Example: --visual_npu_chunks 4 on a 24-block ViT produces 4 chunks of 6 blocks each.')
+    parser.add_argument('--visual_chunk_backends', type=str, default='', help='Optional per-chunk backend routing for --visual_npu_chunks. Comma-separated list with length == K. Allowed tokens: cpu,npu (or hiai). Example: --visual_npu_chunks 6 --visual_chunk_backends "npu,npu,cpu,cpu,npu,cpu".')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
+    parser.add_argument('--cleanup_onnx', action='store_true', help='Delete intermediate onnx files after export.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
     parser.add_argument('--quant_block', type=int, default=64, help='mnn quant block, 0 mean channel-wise, default is 64.')
     parser.add_argument('--visual_quant_bit', type=int, default=None, help='mnn visual quant bit, 4 or 8, default is setting in utils/vision.py by different vit model.')
@@ -769,6 +1269,7 @@ def main():
         llm_exporter.response(args.test)
 
     if args.export is not None:
+        print('export model to', args.export)
         llm_exporter.export(args.export)
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@
 //
 
 #include <string.h>
+// #include <fstream>
 #include "core/Pipeline.hpp"
 #include "core/Backend.hpp"
 #include "core/Macro.h"
@@ -18,7 +19,7 @@
 
 // TODO: Find better way for debug
 //#define MNN_OP_SEPERATE
-//#define MNN_PIPELINE_DEBUG
+// #define MNN_PIPELINE_DEBUG
 namespace MNN {
 static std::set<OpType> _getQuantPropagateOp(Runtime::CompilerType type) {
     std::set<OpType> propagateOpTypes = { OpType_Raster, OpType_ReLU, OpType_ReLU6, OpType_Pooling,
@@ -546,7 +547,7 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
             continue;
         }
         auto& buffer = info.executeBuffer;
-        // MNN_PRINT("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
+        // printf("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
         for (auto& iterP : buffer.command) {
             auto& iter = *iterP;
             // Create exe
@@ -560,11 +561,28 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
                     cached         = true;
                 }
             }
+            // Dump every op that enters the pipeline to op.txt (append mode,
+            // file opened once per process).
+            // {
+            //     static std::ofstream sOpDumpFile("op.txt", std::ios::out | std::ios::app);
+            //     if (sOpDumpFile.is_open()) {
+            //         sOpDumpFile << EnumNameOpType(iter.op->type())
+            //                     << "\t"
+            //                     << (iter.op->name() ? iter.op->name()->c_str() : "?")
+            //                     << (cached ? "\tcached" : "")
+            //                     << "\n";
+            //         sOpDumpFile.flush();
+            //     }
+            // }
+
             std::shared_ptr<BufferStorage> tmpStorage;
             if (nullptr == iter.execution) {
                 iter.execution.reset(OpCommonUtils::createExecutionWithExternal(mBackend.get(), iter.inputs, iter.outputs, iter.op, &loader, tmpStorage));
             }
             if (nullptr == iter.execution) {
+                // 这里是"主 backend(NPU) 不支持，落到 backup
+                // backend(CPU)"
+                // printf("[FALLBACK] op type=%s name=%s -> backup backend\n", EnumNameOpType(iter.op->type()), iter.op->name() ? iter.op->name()->c_str(): "?");
                 // Try Backup
                 iter.execution.reset(OpCommonUtils::createExecutionWithExternal(mBackupBackend.get(), iter.inputs, iter.outputs, iter.op, &loader, tmpStorage));
                 if (nullptr == iter.execution) {
@@ -598,7 +616,7 @@ static void _SetTensorBackend(Schedule::PipelineInfo& mInfo, bool ownInputs) {
             continue;
         }
         auto& buffer = info.executeBuffer;
-        // MNN_PRINT("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
+        // printf("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
         for (int iterIndex=0; iterIndex<buffer.command.size(); ++iterIndex) {
             auto& iterP = buffer.command[iterIndex];
             auto& iter = *iterP;
@@ -629,7 +647,7 @@ static void _SetTensorBackend(Schedule::PipelineInfo& mInfo, bool ownInputs) {
             continue;
         }
         auto& buffer = info.executeBuffer;
-        // MNN_PRINT("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
+        // printf("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
         for (auto& iterP : buffer.command) {
             auto& iter = *iterP;
             if (iter.op->type() == OpType_Copy) {
@@ -702,7 +720,7 @@ static ErrorCode _InsertCopy(Schedule::PipelineInfo& mInfo, std::map<Tensor*, st
             auto curBackend = iter.execution->backend();
 #ifdef MNN_PIPELINE_DEBUG
             if (nullptr != iter.op->name()) {
-                MNN_PRINT("%s Run on %d\n", iter.op->name()->c_str(), curBackend->type());
+                printf("%s Run on %d\n", iter.op->name()->c_str(), curBackend->type());
             }
 #endif
             iter.workInputs = iter.inputs;
@@ -856,7 +874,7 @@ ErrorCode Pipeline::fixResizeCache() {
     auto res = mInfo.first.cache.first->onSelectDynamicAllocator(1, 2);
     res = res && mInfo.first.cache.second->onSelectDynamicAllocator(1, 2);
     if (!res) {
-        MNN_PRINT("%d backend don't support resize fix optimize\n", mInfo.first.cache.first->type());
+        printf("%d backend don't support resize fix optimize\n", mInfo.first.cache.first->type());
         mGeometryNeedRelease = true;
         return NOT_SUPPORT;
     }
@@ -916,7 +934,7 @@ ErrorCode Pipeline::fixResizeCache() {
 
     mInfo.first.cache.first->onSelectDynamicAllocator(0, 2);
     res && mInfo.first.cache.second->onSelectDynamicAllocator(0, 2);
-    MNN_PRINT("Fix: %d - Total: %d, rate = %f\n", fixNumber, totalNumber, (float)fixNumber / (float)totalNumber);
+    printf("Fix: %d - Total: %d, rate = %f\n", fixNumber, totalNumber, (float)fixNumber / (float)totalNumber);
 #endif
     return NO_ERROR;
 }
@@ -930,7 +948,7 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
             continue;
         }
         auto& buffer = info.executeBuffer;
-        // MNN_PRINT("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
+        // printf("before resize, mInfo.second size:%lu, command size:%lu,op type:%s, op name:%s\n", mInfo.second.size(), buffer.command.size(), EnumNameOpType(info.op->type()), info.op->name()->c_str());
         for (auto& iterP : buffer.command) {
             auto& iter = *iterP;
             for (auto t : iter.workInputs) {
@@ -972,7 +990,7 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
 #ifdef MNN_PIPELINE_DEBUG
             auto memory = const_cast<Runtime*>(mRuntime)->onGetMemoryInMB();
             if (nullptr != info.op->name()) {
-                MNN_PRINT("%f, before Resize: %s - %d\n", memory, info.op->name()->c_str(), cmdIndex);
+                printf("%f, before Resize: %s - %d\n", memory, info.op->name()->c_str(), cmdIndex);
             }
 #endif
             // Alloc for Tensors
@@ -997,7 +1015,7 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
             }
 #ifdef MNN_PIPELINE_DEBUG
             if (iter.info != nullptr) {
-                MNN_PRINT("before Resize 2, calling: %s - %d \n", iter.info->name().c_str(), cmdIndex);
+                printf("before Resize 2, calling: %s - %d \n", iter.info->name().c_str(), cmdIndex);
             }
 #endif
             if (iter.group == index) {
@@ -1036,13 +1054,13 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
         return code;
     }
 #ifdef MNN_PIPELINE_DEBUG
-    MNN_PRINT("Resize %d op for index: %d\n", resizeNumber, index);
+    printf("Resize %d op for index: %d\n", resizeNumber, index);
 #endif
     code = mBackupBackend->onResizeEnd();
     return code;
 }
 ErrorCode Pipeline::allocMemory(bool firstMalloc, bool forbidReplace) {
-    // MNN_PRINT("allocMemory mtype:%d, cpubackendType:%d, cpuBackend runtime:%p\n", mBackend->type(), mBackupBackend->type(), mBackupBackend->getRuntime());
+    // printf("allocMemory mtype:%d, cpubackendType:%d, cpuBackend runtime:%p\n", mBackend->type(), mBackupBackend->type(), mBackupBackend->getRuntime());
     if (!firstMalloc) {
         if (OpCommonUtils::supportDynamicInputMemory(mInfo.first.cache.first->type()) && (!mInfo.first.inputBackendChange)) {
             return NO_ERROR;
@@ -1077,7 +1095,7 @@ ErrorCode Pipeline::allocMemory(bool firstMalloc, bool forbidReplace) {
             }
         }
         if (currentInitCount > 0) {
-            MNN_PRINT("Turn back to cpu\n");
+            printf("Turn back to cpu\n");
             // Reset execution
             for (auto& info : mInfo.second) {
                 info.executionCache.clear();
@@ -1161,7 +1179,7 @@ ErrorCode Pipeline::execute() {
                     deviceOfOutput = deviceOfOutput + " " + std::to_string(cmd.workOutputs[v]->deviceId()) + " ";
                 }
                 deviceOfOutput += "]";
-                MNN_PRINT("Group: %d, %s - %d, type=%s, inputs: %s, devices: %s - %s\n", info.group, info.op->name()->c_str(), cmdIndex, EnumNameOpType(cmd.op->type()), groupOfInput.c_str(), deviceOfInput.c_str(), deviceOfOutput.c_str());
+                printf("%s - %d, type=%s, inputs: %s, devices: %s - %s\n", info.op->name()->c_str(), cmdIndex, EnumNameOpType(cmd.op->type()), groupOfInput.c_str(), deviceOfInput.c_str(), deviceOfOutput.c_str());
             }
 #endif
             auto code = cmd.execution->onExecute(cmd.workInputs, cmd.workOutputs);

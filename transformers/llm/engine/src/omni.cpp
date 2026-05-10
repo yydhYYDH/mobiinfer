@@ -11,7 +11,13 @@
 #endif
 #include <regex>
 #include <algorithm>
+#include <cctype>
 #include <random>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <cstdlib>
+#include <MNN/Interpreter.hpp>
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
 #include "omni.hpp"
@@ -29,9 +35,138 @@
 #ifdef LLM_SUPPORT_AUDIO
 #include <audio/audio.hpp>
 #endif
+
+// #define DBG_DEEPSTACK
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+#ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
+#define MNN_HIAI_CACHE_OM_BY_CHUNK 0
+#endif
+
+namespace {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+static constexpr bool kIsX86 = true;
+#else
+static constexpr bool kIsX86 = false;
+#endif
+
+static bool shouldDumpX86Log(const std::shared_ptr<LlmConfig>& config) {
+    if (!kIsX86 || config == nullptr) {
+        return false;
+    }
+    return false;
+    const auto backend = config->backend_type(true);
+    return backend == "cpu" || backend == "auto";
+}
+
+static std::string getX86LogPath(const std::shared_ptr<LlmConfig>& config) {
+    const char* envPath = std::getenv("MNN_OMNI_LOG_PATH");
+    if (envPath != nullptr && envPath[0] != '\0') {
+        return std::string(envPath);
+    }
+    if (config != nullptr) {
+        return config->config_.value("omni_log_path", std::string("omni_x86.log"));
+    }
+    return "omni_x86.log";
+}
+
+static std::string typeToString(const halide_type_t& type) {
+    std::string code;
+    switch (type.code) {
+        case halide_type_float: code = "f"; break;
+        case halide_type_int: code = "i"; break;
+        case halide_type_uint: code = "u"; break;
+        default: code = "t"; break;
+    }
+    return code + std::to_string(type.bits);
+}
+
+static void dumpIdsToLog(std::ofstream& ofs, const std::string& name, const std::vector<int>& ids) {
+    ofs << name << " size=" << ids.size() << " values:";
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ofs << (i == 0 ? " " : ", ") << ids[i];
+    }
+    ofs << "\n";
+}
+
+static void dumpVarpToLog(std::ofstream& ofs, const std::string& name, VARP var) {
+    if (var == nullptr) {
+        ofs << name << " = <null>\n";
+        return;
+    }
+    auto info = var->getInfo();
+    if (info == nullptr) {
+        ofs << name << " = <no info>\n";
+        return;
+    }
+    ofs << name << " shape=[";
+    for (size_t i = 0; i < info->dim.size(); ++i) {
+        ofs << info->dim[i];
+        if (i + 1 < info->dim.size()) ofs << ", ";
+    }
+    ofs << "] type=" << typeToString(info->type) << " size=" << info->size << "\n";
+
+    VARP readVar = var;
+    if (!(info->type.code == halide_type_float && info->type.bits == 32)) {
+        readVar = _Cast(var, halide_type_of<float>());
+    }
+    auto readInfo = readVar->getInfo();
+    if (readInfo == nullptr) {
+        ofs << name << " <no readable info>\n";
+        return;
+    }
+    auto ptr = readVar->readMap<float>();
+    if (ptr == nullptr) {
+        ofs << name << " <null map>\n";
+        return;
+    }
+    ofs << std::setprecision(8) << name << " values:";
+    const int lineBreak = 16;
+    for (int i = 0; i < readInfo->size; ++i) {
+        if (i % lineBreak == 0) {
+            ofs << "\n";
+        }
+        ofs << ptr[i] << " ";
+    }
+    ofs << "\n";
+}
+
+static std::string varShapeString(const VARP& v) {
+    if (v.get() == nullptr || v->getInfo() == nullptr) return "<null>";
+    std::ostringstream oss;
+    auto info = v->getInfo();
+    for (int i = 0; i < (int)info->dim.size(); i++) {
+        oss << info->dim[i];
+        if (i + 1 < (int)info->dim.size()) oss << "x";
+    }
+    return oss.str();
+}
+
+static VARP makeHostBridgeVar(const VARP& src, const char* name) {
+    if (src.get() == nullptr || src->getInfo() == nullptr) return src;
+    auto info = src->getInfo();
+    auto srcHost = src->readMap<uint8_t>();
+    if (srcHost == nullptr) {
+        MNN_ERROR("[vision-chunk] makeHostBridgeVar: source host null, keep original var (shape=[%s])\n",
+                  varShapeString(src).c_str());
+        return src;
+    }
+    auto bridge = Express::_Input(info->dim, NCHW, info->type);
+    auto dstHost = bridge->writeMap<uint8_t>();
+    if (dstHost == nullptr) {
+        MNN_ERROR("[vision-chunk] makeHostBridgeVar: bridge writeMap null, keep original var (shape=[%s])\n",
+                  varShapeString(src).c_str());
+        return src;
+    }
+    ::memcpy(dstHost, srcHost, (size_t)info->size * (size_t)info->type.bytes());
+    if (name != nullptr) {
+        bridge->setName(name);
+    }
+    return bridge;
+}
+}
 
 template <typename T>
 static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
@@ -53,6 +188,10 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
         return MNN_FORWARD_VULKAN;
     if (type_str == "npu")
         return MNN_FORWARD_NN;
+    if (type_str == "hiai")
+        return MNN_FORWARD_USER_0;
+    if (type_str == "hiai_delegate")
+        return MNN_FORWARD_USER_1;
     return MNN_FORWARD_AUTO;
 }
 
@@ -118,10 +257,20 @@ bool Omni::load() {
         return false;
     }
     if (mConfig->has_deepstack()) {
-        mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0)));
+        // Decode-shape baked deepstack_embeds is [3, 1, hidden_size]. Use a
+        // zero placeholder of the same shape so QNN Plugin Op shape inference
+        // matches the decode variant directly. Old code used [3,1,1] which
+        // relied on broadcast (works on CPU, breaks QNN's static-shape check).
+        const int H = mConfig->hidden_size();
+        mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, H}, {3}), _Scalar<float>(0.0)));
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] INIT mExtraArgs[0] shape=%s (omni.cpp:258)\n",
+               varShapeString(mExtraArgs[0]).c_str());
+        fflush(stdout);
+#endif
     }
     Module::Config module_config;
-    if(config.type == MNN_FORWARD_NN) {
+    if(config.type == MNN_FORWARD_NN || config.type == MNN_FORWARD_USER_1) {
         module_config.shapeMutable = false;
         module_config.rearrange    = false;
     } else {
@@ -129,9 +278,136 @@ bool Omni::load() {
         module_config.rearrange    = true;
     }
     if (mConfig->is_visual()) {
-        mVisionModule.reset(Module::load({}, {}, mConfig->visual_model().c_str(), mProcessorRuntimeManager, &module_config));
-        if (nullptr == mVisionModule.get()) {
-            return false;
+        if (mConfig->visual_split()) {
+            // Split mode: pre/post on mProcessorRuntimeManager (usually CPU),
+            // blocks on a dedicated runtime (typically NPU/HiAI).
+            ScheduleConfig npuCfg;
+            BackendConfig npuBackendConfig;
+            npuCfg.type          = backend_type_convert(mConfig->visual_blocks_backend_type());
+            npuCfg.numThread     = 1;
+            npuCfg.backendConfig = &npuBackendConfig;
+            mVisionBlocksRuntimeManager.reset(
+                Executor::RuntimeManager::createRuntimeManager(npuCfg));
+            // A/B switch: vision encoder blocks should not rely on decoder KV
+            // hints. Keep default behavior (true) unless explicitly disabled.
+            bool visualBlocksKvHints = mConfig->config_.value("visual_blocks_kv_hints", true);
+            setRuntimeHint(mVisionBlocksRuntimeManager, visualBlocksKvHints);
+
+            Module::Config npuModuleCfg;
+            if (npuCfg.type == MNN_FORWARD_USER_0 ||
+                npuCfg.type == MNN_FORWARD_USER_1 ||
+                npuCfg.type == MNN_FORWARD_NN) {
+                npuModuleCfg.shapeMutable = false;
+                npuModuleCfg.rearrange    = false;
+            } else {
+                npuModuleCfg.shapeMutable = true;
+                npuModuleCfg.rearrange    = true;
+            }
+
+            mVisionPreModule.reset(Module::load(
+                {}, {}, mConfig->visual_pre_model().c_str(),
+                mProcessorRuntimeManager, &module_config));
+            mVisionPostModule.reset(Module::load(
+                {}, {}, mConfig->visual_post_model().c_str(),
+                mProcessorRuntimeManager, &module_config));
+            if (nullptr == mVisionPreModule.get() ||
+                nullptr == mVisionPostModule.get()) {
+                return false;
+            }
+            // Three paths, highest priority first:
+            //  (a) visual_blocks_chunks non-empty: K-chunk NPU split. Each chunk
+            //      is a smaller .mnn; loading them sequentially keeps the HiAI
+            //      IR-build peak memory at O(1/K) of the monolithic build.
+            //  (b) visual_npu_layers > 0 (legacy 2-chunk): first N layers on NPU,
+            //      rest on CPU. Kept for back-compat.
+            //  (c) default: monolithic visual_blocks.mnn on the NPU runtime.
+            auto chunkPaths = mConfig->visual_blocks_chunks();
+            if (!chunkPaths.empty()) {
+                // Optional per-chunk backend routing.
+                // If absent, keep historical behavior: all chunks on NPU runtime.
+                std::vector<bool> chunkRunOnNpu(chunkPaths.size(), true);
+                if (mConfig->config_.contains("visual_blocks_chunk_backends")) {
+                    auto arr = mConfig->config_["visual_blocks_chunk_backends"];
+                    if (!arr.is_array() || arr.size() != chunkPaths.size()) {
+                        MNN_ERROR("visual_blocks_chunk_backends must be an array and size must equal visual_blocks_chunks (%zu)\n",
+                                  chunkPaths.size());
+                        return false;
+                    }
+                    for (size_t i = 0; i < arr.size(); i++) {
+                        if (!arr[i].is_string()) {
+                            MNN_ERROR("visual_blocks_chunk_backends[%zu] must be string 'cpu' or 'npu'\n", i);
+                            return false;
+                        }
+                        auto bk = arr[i].get<std::string>();
+                        std::transform(bk.begin(), bk.end(), bk.begin(),
+                                       [](unsigned char c) { return (char)std::tolower(c); });
+                        if (bk == "cpu") {
+                            chunkRunOnNpu[i] = false;
+                        } else if (bk == "npu" || bk == "hiai") {
+                            chunkRunOnNpu[i] = true;
+                        } else {
+                            MNN_ERROR("visual_blocks_chunk_backends[%zu] invalid value: %s (expect cpu/npu)\n",
+                                      i, bk.c_str());
+                            return false;
+                        }
+                    }
+                }
+                mVisionBlocksChunkModules.reserve(chunkPaths.size());
+                const auto npuCacheBaseDir = mConfig->npu_model_dir();
+                for (size_t i = 0; i < chunkPaths.size(); i++) {
+                    auto targetRuntime = chunkRunOnNpu[i] ? mVisionBlocksRuntimeManager : mProcessorRuntimeManager;
+                    auto targetModuleCfg = chunkRunOnNpu[i] ? &npuModuleCfg : &module_config;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+                    if (chunkRunOnNpu[i] && !npuCacheBaseDir.empty()) {
+                        auto chunkNpuDir = npuCacheBaseDir + "/chunk_" + std::to_string(i);
+                        mVisionBlocksRuntimeManager->setExternalPath(
+                            chunkNpuDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                    }
+#endif
+                    std::shared_ptr<Module> mod(Module::load(
+                        {}, {}, chunkPaths[i].c_str(),
+                        targetRuntime, targetModuleCfg));
+                    if (nullptr == mod.get()) {
+                        MNN_ERROR("visual_blocks chunk[%zu] load failed: %s\n",
+                                  i, chunkPaths[i].c_str());
+                        return false;
+                    }
+                    mVisionBlocksChunkModules.push_back(mod);
+                }
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+                if (!npuCacheBaseDir.empty()) {
+                    mVisionBlocksRuntimeManager->setExternalPath(
+                        npuCacheBaseDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                }
+#endif
+            } else if (mConfig->visual_npu_layers() > 0) {
+                mVisionBlocksNpuModule.reset(Module::load(
+                    {}, {}, mConfig->visual_blocks_npu_model().c_str(),
+                    mVisionBlocksRuntimeManager, &npuModuleCfg));
+                mVisionBlocksCpuModule.reset(Module::load(
+                    {}, {}, mConfig->visual_blocks_cpu_model().c_str(),
+                    mProcessorRuntimeManager, &module_config));
+                if (nullptr == mVisionBlocksNpuModule.get() ||
+                    nullptr == mVisionBlocksCpuModule.get()) {
+                    MNN_ERROR("visual_npu_layers=%d set but failed to load npu/cpu chunk modules (%s / %s)\n",
+                              mConfig->visual_npu_layers(),
+                              mConfig->visual_blocks_npu_model().c_str(),
+                              mConfig->visual_blocks_cpu_model().c_str());
+                    return false;
+                }
+            } else {
+                mVisionBlocksModule.reset(Module::load(
+                    {}, {}, mConfig->visual_blocks_model().c_str(),
+                    mVisionBlocksRuntimeManager, &npuModuleCfg));
+                if (nullptr == mVisionBlocksModule.get()) {
+                    return false;
+                }
+            }
+        } else {
+            mVisionModule.reset(Module::load({}, {}, mConfig->visual_model().c_str(), mProcessorRuntimeManager, &module_config));
+            if (nullptr == mVisionModule.get()) {
+                return false;
+            }
         }
     }
     if (mConfig->is_audio()) {
@@ -146,6 +422,7 @@ bool Omni::load() {
 
 #ifdef LLM_SUPPORT_VISION
 std::vector<int> Omni::defaultVisionProcess(VARP image) {
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     MNN::Express::ExecutorScope s(mExecutor);
     mVisionHeight = UP_DIV(mVisionHeight, mVisionSizeUnit) * mVisionSizeUnit;
     mVisionWidth  = UP_DIV(mVisionWidth, mVisionSizeUnit) * mVisionSizeUnit;
@@ -154,7 +431,21 @@ std::vector<int> Omni::defaultVisionProcess(VARP image) {
                             mVisionMean, mVisionNorm);
     image = Express::_Unsqueeze(image, {0});
     image = Express::_Convert(image, NC4HW4);
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] defaultVisionProcess input\n";
+            dumpVarpToLog(ofs, "vision_input", image);
+        }
+    }
     auto imageEmbedding = mVisionModule->forward(image);
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] defaultVisionProcess output\n";
+            dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        }
+    }
 
     mVisionEmbeddings.push_back(imageEmbedding);
     int visionLen = imageEmbedding->getInfo()->dim[0];
@@ -168,10 +459,17 @@ std::vector<int> Omni::defaultVisionProcess(VARP image) {
 
 std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     AUTOTIME;
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     MNN::Express::ExecutorScope s(mExecutor);
-    const auto inputNames = mVisionModule->getInfo()->inputNames;
-    bool hasWindowIndex = inputNames.size() == 4 && inputNames[3] == "window_index";
-    bool isQwen3VL = inputNames.size() == 5 && inputNames[3] == "idx_tensor";
+    const bool isSplit = mConfig->visual_split();
+    const auto& probeModule = isSplit ? mVisionPreModule : mVisionModule;
+    const auto inputNames = probeModule->getInfo()->inputNames;
+    // In split mode pre-module drops the "attention_mask" input (mask goes to
+    // blocks). Offsets after position_ids shift by -1 accordingly.
+    const int maskOffset = isSplit ? 0 : 1;
+    bool hasWindowIndex = (!isSplit) && inputNames.size() == 4 && inputNames[3] == "window_index";
+    bool isQwen3VL = inputNames.size() == (size_t)(4 + maskOffset)
+                     && inputNames[2 + maskOffset] == "idx_tensor";
     const int patch_size = isQwen3VL ? 16 : 14;
     constexpr int temporal_patch_size = 2;
     constexpr int merge_size = 2;
@@ -222,7 +520,7 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
             wpos_ptr[index] = j;
         }
     }
-    VARP attention_mask, window_index;
+    VARP attention_mask, window_index, idx_tensor, weight_tensor;
     VARPS moduleInputs= {patches, position_ids};
     if (hasWindowIndex) {
         // Qwen2.5-VL: build window_index
@@ -300,8 +598,8 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
         for (int i = 0; i < grid_w; ++i) {
             w_idxs[i] = static_cast<float>(i) * (num_grid - 1) / (grid_w - 1);
         }
-        auto idx_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<int>());
-        auto weight_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<float>());
+        idx_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<int>());
+        weight_tensor = Express::_Input({4, num_patches}, NCHW, halide_type_of<float>());
         auto idx_ptr = idx_tensor->writeMap<int>();
         auto weight_ptr = weight_tensor->writeMap<float>();
         for (int i = 0; i < grid_h; ++i) {
@@ -341,7 +639,155 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     attention_mask->setName("attention_mask");
     MNN::Express::Variable::save({patches, position_ids, attention_mask}, "input.mnn");
 #endif
-    auto outputs = mVisionModule->onForward(moduleInputs);
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] qwen2VisionProcess inputs\n";
+            dumpVarpToLog(ofs, "patches", patches);
+            dumpVarpToLog(ofs, "position_ids", position_ids);
+            dumpVarpToLog(ofs, "attention_mask", attention_mask);
+            if (hasWindowIndex) {
+                dumpVarpToLog(ofs, "window_index", window_index);
+            }
+            if (isQwen3VL) {
+                dumpVarpToLog(ofs, "idx_tensor", idx_tensor);
+                dumpVarpToLog(ofs, "weight_tensor", weight_tensor);
+            }
+        }
+    }
+    VARPS outputs;
+    if (isSplit) {
+        // moduleInputs layout (monolithic):
+        //   [patches, position_ids, attention_mask, (idx_tensor, weight_tensor) | window_index]
+        // Pre inputs = moduleInputs minus attention_mask (index 2).
+        VARPS preInputs;
+        preInputs.reserve(moduleInputs.size() - 1);
+        for (size_t i = 0; i < moduleInputs.size(); ++i) {
+            if (i == 2) continue; // skip attention_mask
+            preInputs.push_back(moduleInputs[i]);
+        }
+        auto preOut = mVisionPreModule->onForward(preInputs);
+        if (preOut.size() < 2) {
+            MNN_ERROR("visual_pre expected >=2 outputs (hidden_states, rotary_pos_emb), got %zu\n",
+                      preOut.size());
+            return std::vector<int>(0);
+        }
+        // Pre outputs / mask may come from non-CPU runtime; force host materialize
+        // before feeding blocks to avoid src.host==NULL during NPU input copy.
+        auto pre0Ptr = preOut[0]->readMap<void>();
+        auto pre1Ptr = preOut[1]->readMap<void>();
+        auto maskPtr = attention_mask->readMap<void>();
+        if (pre0Ptr == nullptr || pre1Ptr == nullptr || maskPtr == nullptr) {
+            MNN_ERROR("[vision-chunk] pre materialize null: pre0=%p pre1=%p mask=%p "
+                      "pre0Shape=[%s] pre1Shape=[%s] maskShape=[%s]\n",
+                      pre0Ptr, pre1Ptr, maskPtr,
+                      varShapeString(preOut[0]).c_str(),
+                      varShapeString(preOut[1]).c_str(),
+                      varShapeString(attention_mask).c_str());
+        }
+        VARPS blocksIn = {preOut[0], preOut[1], attention_mask};
+        
+        // printf("\n----- VISUAL_BLOCKS_MODEL REAL INPUT SHAPES -----\n");
+        // for (int i = 0; i < blocksIn.size(); ++i) {
+        //     auto info = blocksIn[i]->getInfo();
+        //     if (info) {
+        //         printf("Input %d shape: ", i);
+        //         for (int d = 0; d < info->dim.size(); ++d) {
+        //             printf("%d ", info->dim[d]);
+        //         }
+        //         printf("\n");
+        //     } else {
+        //         printf("Input %d shape: UNKNOWN\n", i);
+        //     }
+        // }
+        // printf("--------------------------------------------------\n\n");
+
+        VARPS blocksOut;
+        if (!mVisionBlocksChunkModules.empty()) {
+            // K-chunk NPU split: chain each chunk's hidden_states output into the
+            // next chunk's input; rotary_pos_emb and attention_mask are reused.
+            // Deepstack outputs from each chunk are appended in chunk order,
+            // which matches the GLOBAL deepstack ordering the post module
+            // expects (export side names them deepstack_hidden_0 .. _{M-1}).
+            VARP curHidden = preOut[0];
+            VARPS allDeepstack;
+            for (size_t i = 0; i < mVisionBlocksChunkModules.size(); i++) {
+                VARPS chunkIn = {curHidden, preOut[1], attention_mask};
+                // Mixed CPU/NPU chunk routing requires explicit host-side materialize
+                // before each chunk run.
+                auto in0 = chunkIn[0]->readMap<void>();
+                auto in1 = chunkIn[1]->readMap<void>();
+                auto in2 = chunkIn[2]->readMap<void>();
+                if (in0 == nullptr || in1 == nullptr || in2 == nullptr) {
+                    MNN_ERROR("[vision-chunk] chunk[%zu] input host null: in0=%p in1=%p in2=%p "
+                              "shape0=[%s] shape1=[%s] shape2=[%s]\n",
+                              i, in0, in1, in2,
+                              varShapeString(chunkIn[0]).c_str(),
+                              varShapeString(chunkIn[1]).c_str(),
+                              varShapeString(chunkIn[2]).c_str());
+                }
+                auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
+                if (chunkOut.empty()) {
+                    MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
+                    return std::vector<int>(0);
+                }
+                // Bridge NPU output through an explicit host-backed VARP before
+                // feeding the next chunk, to avoid src.host==NULL in onCopyBuffer.
+                curHidden = makeHostBridgeVar(chunkOut[0], "vision_chunk_hidden_bridge");
+                // Each HiAI model has isolated ION I/O buffers, so chunk-to-chunk
+                // handoff must go through a host copy. Express allocates the host
+                // intermediate lazily; force materialize every chunk output to host
+                // here so the next chunk (or the CPU post-module) sees a populated
+                // host buffer and does not crash in NPUBackend::onCopyBuffer.
+                (void)curHidden->readMap<void>();
+                for (size_t j = 1; j < chunkOut.size(); j++) {
+                    (void)chunkOut[j]->readMap<void>();
+                    allDeepstack.push_back(makeHostBridgeVar(chunkOut[j], "vision_chunk_deepstack_bridge"));
+                }
+            }
+            blocksOut.reserve(1 + allDeepstack.size());
+            blocksOut.push_back(curHidden);
+            for (auto& d : allDeepstack) blocksOut.push_back(d);
+        } else if (mVisionBlocksNpuModule.get() != nullptr &&
+            mVisionBlocksCpuModule.get() != nullptr &&
+            mConfig->visual_npu_layers() > 0) {
+            // Temporary NPU test mode: first-N layers on NPU, rest on CPU. The two
+            // modules share identical I/O signature (hidden, rotary, mask → hidden
+            // + deepstack_hidden_k for k in their local range). Deepstack outputs
+            // are concatenated in original global order: NPU chunk outputs first
+            // (for layers < N), then CPU chunk outputs (for layers >= N).
+            auto npuOut = mVisionBlocksNpuModule->onForward(blocksIn);
+            if (npuOut.empty()) {
+                MNN_ERROR("visual_blocks_npu: empty output\n");
+                return std::vector<int>(0);
+            }
+            (void)npuOut[0]->readMap<void>();
+            (void)preOut[1]->readMap<void>();
+            (void)attention_mask->readMap<void>();
+            VARPS cpuIn = {npuOut[0], preOut[1], attention_mask};
+            auto cpuOut = mVisionBlocksCpuModule->onForward(cpuIn);
+            if (cpuOut.empty()) {
+                MNN_ERROR("visual_blocks_cpu: empty output\n");
+                return std::vector<int>(0);
+            }
+            blocksOut.reserve(cpuOut.size() + (npuOut.size() - 1));
+            // Final hidden_states comes from the CPU chunk (last layer).
+            blocksOut.push_back(cpuOut[0]);
+            // Deepstack from NPU chunk (indexes < N) first.
+            for (size_t i = 1; i < npuOut.size(); i++) {
+                blocksOut.push_back(npuOut[i]);
+            }
+            // Then deepstack from CPU chunk (indexes >= N).
+            for (size_t i = 1; i < cpuOut.size(); i++) {
+                blocksOut.push_back(cpuOut[i]);
+            }
+        } else {
+            blocksOut = mVisionBlocksModule->onForward(blocksIn);
+        }
+        outputs = mVisionPostModule->onForward(blocksOut);
+    } else {
+        outputs = mVisionModule->onForward(moduleInputs);
+    }
     auto imageEmbedding = outputs[0];
     if (outputs.size() == 2) {
         mDeepStackEmbeddings.push_back(outputs[1]);
@@ -350,6 +796,13 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
     imageEmbedding->setName("image_embeds");
     MNN::Express::Variable::save({imageEmbedding}, "output.mnn");
 #endif
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] qwen2VisionProcess output\n";
+            dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        }
+    }
     mVisionEmbeddings.push_back(imageEmbedding);
     int visionLen = imageEmbedding->getInfo()->dim[0];
     std::vector<int> imgIds(visionLen, mVisionPad);
@@ -361,6 +814,8 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
 std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
     MNN::Express::ExecutorScope s(mExecutor);
     // SmolVLM / LFM2-VL: compute visionLen from global image forward
+    const bool dumpLog = shouldDumpX86Log(mConfig);
+
     bool splitImage = mVisionHeight > mVisionSizeUnit || mVisionWidth > mVisionSizeUnit;
     auto globalImage = MNN::CV::resize(image, {mVisionSizeUnit, mVisionSizeUnit}, 0, 0,
                                        MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
@@ -410,7 +865,21 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
             mVisionSizeUnit,
             mVisionSizeUnit
         });
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess input\n";
+                dumpVarpToLog(ofs, "pixel_values", patches);
+            }
+        }
         auto imageEmbedding = mVisionModule->forward(patches);
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess output\n";
+                dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+            }
+        }
         auto embeddingDims = imageEmbedding->getInfo()->dim;
         for (int i = 0; i < embeddingDims[0]; i++) {
             auto embedding = _Squeeze(_GatherV2(imageEmbedding, _var<int>({i}, {1}), _var<int>({0}, {1})), {0});
@@ -433,6 +902,20 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
         }
         imgIds.push_back(endRow);
     } else {
+        if (dumpLog) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[vision] smolvlmVisionProcess input(global)\n";
+                dumpVarpToLog(ofs, "pixel_values", globalImage);
+            }
+        }
+        // if (dumpLog) {
+        //     std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        //     if (ofs) {
+        //         ofs << "\n[vision] smolvlmVisionProcess output(global)\n";
+        //         dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        //     }
+        // }
         mVisionEmbeddings.push_back(_Squeeze(globalEmbedding, {0}));
     }
     // global image ids
@@ -515,6 +998,7 @@ std::vector<std::pair<int, int>> minicpmBestSize(std::pair<int, int> original_si
 }
 
 std::vector<int> Omni::minicpmVisionProcess(VARP image) {
+    const bool dumpLog = shouldDumpX86Log(mConfig);
     MNN::Express::ExecutorScope s(mExecutor);
     constexpr int visionLen = 64, patchesPerSide = 70;
     const int patchSize = mVisionSizeUnit;
@@ -604,7 +1088,24 @@ std::vector<int> Omni::minicpmVisionProcess(VARP image) {
     // tgt size
     auto tgt_sizes = Express::_Input({B, 2}, NCHW, halide_type_of<int>());
     ::memcpy(tgt_sizes->writeMap<int>(), tgtSize.data(), tgtSize.size() * sizeof(int));
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] minicpmVisionProcess inputs\n";
+            dumpVarpToLog(ofs, "pixel_values", pixel_values);
+            dumpVarpToLog(ofs, "position_ids", position_ids);
+            dumpVarpToLog(ofs, "attention_mask", attention_mask);
+            dumpVarpToLog(ofs, "tgt_sizes", tgt_sizes);
+        }
+    }
     auto imageEmbedding = mVisionModule->onForward({pixel_values, position_ids, attention_mask, tgt_sizes})[0];
+    if (dumpLog) {
+        std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+        if (ofs) {
+            ofs << "\n[vision] minicpmVisionProcess output\n";
+            dumpVarpToLog(ofs, "vision_output", imageEmbedding);
+        }
+    }
     for (int i = 0; i < B; i++) {
         auto embedding = _Permute(_GatherV2(imageEmbedding, _var<int>({i}, {1}), _var<int>({0}, {1})), {1, 0, 2});
         mVisionEmbeddings.push_back(embedding);
@@ -656,7 +1157,8 @@ std::vector<int> Omni::visionProcess(VARP image) {
     }
     Timer _t;
     std::vector<int> imgIds;
-    const auto inputNames = mVisionModule->getInfo()->inputNames;
+    const auto& probeModule = mConfig->visual_split() ? mVisionPreModule : mVisionModule;
+    const auto inputNames = probeModule->getInfo()->inputNames;
     if (inputNames.size() >= 3 && inputNames[0] == "patches") {
         imgIds = qwen2VisionProcess(image);
     } else if (inputNames[0] == "pixel_values") {
@@ -925,9 +1427,25 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     MNN::Express::ExecutorScope s(mExecutor);
     if (input_ids.size() == 1) {
         if (mConfig->has_deepstack() && mExtraArgs.size() == 1) {
-            mExtraArgs[0] = Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0));
+            // Match baked decode shape [3, 1, hidden_size] -- see omni.cpp:258.
+            const int H = mConfig->hidden_size();
+            mExtraArgs[0] = Express::_Fill(_var<int>({3, 1, H}, {3}), _Scalar<float>(0.0));
+#ifdef DBG_DEEPSTACK
+            printf("[DBG_DEEPSTACK] RESET (text decode) mExtraArgs[0] shape=%s (omni.cpp:1418)\n",
+                   varShapeString(mExtraArgs[0]).c_str());
+            fflush(stdout);
+#endif
         }
-        return Llm::embedding(input_ids);
+        auto single_embedding = Llm::embedding(input_ids);
+        if (shouldDumpX86Log(mConfig)) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[text] embedding(single)\n";
+                dumpIdsToLog(ofs, "text_ids", input_ids);
+                dumpVarpToLog(ofs, "text_embeds", single_embedding);
+            }
+        }
+        return single_embedding;
     }
     std::vector<VARP> embeddings;
     std::vector<VARP> deepstacks;
@@ -961,6 +1479,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             if(txt_embedding == nullptr) {
                 return nullptr;
             }
+            if (shouldDumpX86Log(mConfig)) {
+                std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+                if (ofs) {
+                    ofs << "\n[text] embedding(before audio)\n";
+                    dumpIdsToLog(ofs, "text_ids", cur_txt_ids);
+                    dumpVarpToLog(ofs, "text_embeds", txt_embedding);
+                }
+            }
             auto mul_embedding = mAudioEmbeddings[audio_idx++];
             embeddings.push_back(txt_embedding);
             embeddings.push_back(mul_embedding);
@@ -978,6 +1504,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
             if(txt_embedding == nullptr) {
                 return nullptr;
+            }
+            if (shouldDumpX86Log(mConfig)) {
+                std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+                if (ofs) {
+                    ofs << "\n[text] embedding(before vision)\n";
+                    dumpIdsToLog(ofs, "text_ids", cur_txt_ids);
+                    dumpVarpToLog(ofs, "text_embeds", txt_embedding);
+                }
             }
             if (hasDeepStack) {
                 deepstacksTxt();
@@ -999,6 +1533,14 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
         if(txt_embedding == nullptr) {
             return nullptr;
         }
+        if (shouldDumpX86Log(mConfig)) {
+            std::ofstream ofs(getX86LogPath(mConfig), std::ios::app);
+            if (ofs) {
+                ofs << "\n[text] embedding(tail)\n";
+                dumpIdsToLog(ofs, "text_ids", cur_txt_ids);
+                dumpVarpToLog(ofs, "text_embeds", txt_embedding);
+            }
+        }
         embeddings.push_back(txt_embedding);
         deepstacksTxt();
     }
@@ -1006,6 +1548,16 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     // Qwen3-VL
     if (hasDeepStack) {
         mExtraArgs[0] = Express::_Concat(deepstacks, 1);
+#ifdef DBG_DEEPSTACK
+        printf("[DBG_DEEPSTACK] MULTIMODAL mExtraArgs[0] shape=%s, source segments=%zu (omni.cpp:1531)\n",
+               varShapeString(mExtraArgs[0]).c_str(), deepstacks.size());
+        fflush(stdout);
+        for (size_t i = 0; i < deepstacks.size(); ++i) {
+            printf("[DBG_DEEPSTACK]   segment[%zu] shape=%s\n",
+                   i, varShapeString(deepstacks[i]).c_str());
+            fflush(stdout);
+        }
+#endif
     }
     return embedding;
 }
@@ -1063,7 +1615,74 @@ VARP Omni::gen_position_ids(int seq_len) {
 
 std::vector<Express::VARP> Omni::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) {
     MNN::Express::ExecutorScope s(mExecutor);
-    extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+#ifdef DBG_DEEPSTACK
+    // Per-forward shape dump so we can correlate runtime shapes with baked QNN
+    // graph shapes when a Plugin Op shape check fails.
+    printf("[DBG_DEEPSTACK] forwardRaw: hidden=%s mask=%s pos=%s extraArgs=%zu mExtraArgs=%zu chunkStart=%d chunkSize=%d\n",
+           varShapeString(hiddenState).c_str(),
+           varShapeString(mask).c_str(),
+           varShapeString(inputPos).c_str(),
+           extraArgs.size(), mExtraArgs.size(),
+           mChunkStart, mChunkSize);
+    fflush(stdout);
+    for (size_t i = 0; i < mExtraArgs.size(); ++i) {
+        printf("[DBG_DEEPSTACK]   mExtraArgs[%zu] shape=%s\n",
+               i, varShapeString(mExtraArgs[i]).c_str());
+        fflush(stdout);
+    }
+#endif
+    // If we are in chunked-prefill (mChunkStart >= 0), reshape mExtraArgs[0]
+    // (deepstack_embeds) to exactly [N, mChunkSize, H] so it matches the QNN
+    // graph baked for this chunk size. Three sub-cases:
+    //   total >= chunkEnd            -> slice [chunkStart : chunkEnd]
+    //   chunkStart < total < chunkEnd -> slice valid + zero pad tail
+    //   chunkStart >= total          -> all zeros [N, mChunkSize, H]
+    // For text-only with placeholder [3,1,H], total==1 < chunkEnd so the pad
+    // branch fires and we expand to a full-zero [3, mChunkSize, H].
+    if (mChunkStart >= 0 && mChunkSize > 0 && !mExtraArgs.empty()) {
+        auto ds = mExtraArgs[0];
+        auto info = ds->getInfo();
+        if (info != nullptr && info->dim.size() == 3) {
+            const int N = info->dim[0];
+            const int total = info->dim[1];
+            const int H = info->dim[2];
+            const int chunkEnd = mChunkStart + mChunkSize;
+            VARP shaped;
+            if (total >= chunkEnd) {
+                shaped = Express::_Slice(ds,
+                    _var<int>({0, mChunkStart, 0}, {3}),
+                    _var<int>({N, mChunkSize, H},  {3}));
+            } else if (mChunkStart < total) {
+                auto valid = Express::_Slice(ds,
+                    _var<int>({0, mChunkStart, 0}, {3}),
+                    _var<int>({N, total - mChunkStart, H}, {3}));
+                auto pad = Express::_Fill(
+                    _var<int>({N, chunkEnd - total, H}, {3}),
+                    _Scalar<float>(0.0));
+                shaped = Express::_Concat({valid, pad}, 1);
+            } else {
+                shaped = Express::_Fill(
+                    _var<int>({N, mChunkSize, H}, {3}),
+                    _Scalar<float>(0.0));
+            }
+#ifdef DBG_DEEPSTACK
+            printf("[DBG_DEEPSTACK]   reshaped mExtraArgs[0] -> %s for chunk[%d:%d]\n",
+                   varShapeString(shaped).c_str(), mChunkStart, mChunkStart + mChunkSize);
+            fflush(stdout);
+#endif
+            extraArgs.push_back(shaped);
+            // Skip index 0 of mExtraArgs since we already pushed its reshaped
+            // form; copy the rest as-is (currently mExtraArgs only has the
+            // deepstack tensor at index 0, so the tail loop is a no-op).
+            for (size_t i = 1; i < mExtraArgs.size(); ++i) {
+                extraArgs.push_back(mExtraArgs[i]);
+            }
+        } else {
+            extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+        }
+    } else {
+        extraArgs.insert(extraArgs.end(), mExtraArgs.begin(), mExtraArgs.end());
+    }
     auto outputs = Llm::forwardRaw(hiddenState, mask, inputPos, extraArgs);
     if (mTalker && outputs.size() > 1) {
         mTalker->addTalkerEmbeds(outputs[1]);

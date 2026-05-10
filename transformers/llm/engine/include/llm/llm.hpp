@@ -188,7 +188,11 @@ public:
 protected:
     void setChatTemplate();
     void initRuntime();
-    void setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg);
+    // `enable_kv_hints` controls whether KV-cache-related runtime hints
+    // (e.g. KVCACHE_INFO and reuse_kv attention fallback) are injected.
+    // Useful for A/B on vision-only runtimes where decoder KV semantics
+    // should not be consumed.
+    void setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg, bool enable_kv_hints = true);
     std::shared_ptr<LlmContext> mContext;
     std::shared_ptr<KVMeta> mMeta;
     std::shared_ptr<LlmConfig> mConfig;
@@ -217,6 +221,15 @@ protected:
     friend class EagleGeneration;
     std::vector<Express::VARP> forwardVec(const std::vector<int>& input_ids);
     std::vector<Express::VARP> forwardVec(MNN::Express::VARP input_embeds);
+    // Chunked-prefill window. mChunkStart is the start offset (within the
+    // current full input sequence) of the chunk currently being forwarded;
+    // mChunkSize is the chunk's length after any padding to a baked QNN
+    // graph shape. Set to (>=0, >0) by forwardVec inside the chunked loop and
+    // reset to (-1, 0) outside, so Omni::forwardRaw can slice / pad
+    // mExtraArgs[0] (deepstack_embeds) to match the chunk-shape baked into
+    // the QNN graph. Pure decode (single-token) keeps these at default.
+    int mChunkStart = -1;
+    int mChunkSize  = 0;
 private:
     std::shared_ptr<Generation> mGenerationStrategy;
     void setSpeculativeConfig();

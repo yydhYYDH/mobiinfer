@@ -15,6 +15,11 @@
 # Java class files
 *.class
 
+model/
+transformers/llm/export/model/
+transformers/llm/export/log.txt
+op_info.txt
+
 # Generated files
 bin/
 gen/
@@ -389,6 +394,30 @@ apps/Android/.qoder/settings.json
 apps/Android/MnnLlmChatOld
 
 transformers/llm/export/tmp/
+transformers/llm/export/model*
+
+tools/script/make_llm_test_old.py
+tools/script/make_llm_test.py
+tools/logits_diff*
+
+
+debug1.txt
+debug2.txt
+dumptxt/
+layer_figure/
+layer_figurex86/
+logits.txt
+logits_comparison.png
+transformers/llm/export/logits.txt
+transformers/llm/export/logits_comparison.png
+
+pipelinemodule.md
+dequant_gemm.md
+w4a8_degemm.md
+yuque
+check_gptq.py
+check_gptq_visuasl.txt
+
 
 # iOS
 apps/iOS/MNNLLMChat/Chat/
@@ -396,3 +425,41 @@ apps/iOS/MNNLLMChat/swift-transformers/
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-4B-MNN
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-0.6B-MNN
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
+prompts/
+harmony_agent.py
+
+mobiinfra-oh/
+
+
+harmony_agent_old.py
+harmony_agent_oldtime.py
+hdc_server.py
+screen.jpeg
+source/backend/hiai/3rdParty/
+transformers/llm/engine/demo/prefix.txt
+
+check_gptq_visuasl_perchannel.txt
+
+kirin9030/
+
+
+
+
+hiai-log.txt
+
+test_qwen3vl_op.txt
+
+
+opbuild_out/
+source/backend/hiai/custom/
+
+
+ascendc_layernorm_custom/
+DDK-tools-next-6.0.1.0/
+
+
+claude_chat.txt
+
+# ignore temp scripts
+/extract_llm_*.py
+test_analyze_nonlinear.py

@@ -147,6 +147,29 @@ MNN_PUBLIC VARP _Conv(std::vector<int8_t>&& weight, std::vector<float>&& bias, s
                       float scaleIn, float scaleOut,
                       int8_t inputZeroPoint, int8_t outputZeroPoint,
                       int8_t minValue, int8_t maxValue, float weightClampValue, bool accumulateToInt16);
+// Float-IO, int8 weight hybrid conv (DynamicQuant-style). weightFloat is laid
+// out as [oc, ic/group * kh * kw]. quantBlock=0 → per-output-channel symmetric
+// quant, matching llmexport.py's --quant_block=0. Other values currently fall
+// back to per-channel.
+MNN_PUBLIC VARP _HybridInt8Conv(std::vector<float>&& weightFloat, std::vector<float>&& bias,
+                                VARP x, INTS channel, INTS kernelSize,
+                                PaddingMode pad = VALID, INTS stride = {1, 1}, INTS dilate = {1, 1},
+                                int group = 1, INTS pads = {0, 0}, bool relu = false, bool relu6 = false,
+                                int nbits = 8, int quantBlock = 0);
+
+// Fused self-attention op (OpType_Attention). Expects Q/K/V shaped
+// [B, S, H, D]; mask (optional) broadcastable to [B, H, S_q, S_kv]. Pass a
+// null VARP to omit the mask. Output is [B, S_q, H*D]. With kv_cache=false
+// (the default) this is plain cross-/self-attention without KV reuse.
+MNN_PUBLIC VARP _Attention(VARP query, VARP key, VARP value, VARP mask = nullptr,
+                           bool kv_cache = false);
+// Fused LayerNorm op (OpType_LayerNorm). Normalises x along the trailing
+// contiguous axes given by `axis` (negative values allowed, follows ONNX
+// convention). `gamma`/`beta` may be empty for pure normalisation with no
+// affine step. Set `useRMSNorm=true` for RMSNorm semantics.
+MNN_PUBLIC VARP _LayerNorm(VARP x, std::vector<int32_t> axis, float epsilon,
+                           std::vector<float> gamma = {}, std::vector<float> beta = {},
+                           int group = 1, bool useRMSNorm = false);
 MNN_PUBLIC VARP _CosineSimilarity(VARP input0, VARP input1, VARP inputDim);
 
 enum GridSamplePaddingMode {GRID_SAMPLE_PADDING_ZEROS, GRID_SAMPLE_PADDING_BORDER, GRID_SAMPLE_PADDING_REFLECTION};
