@@ -15,10 +15,15 @@
 #include "core/Schedule.hpp"
 #include "rapidjson/document.h"
 #include <rapidjson/prettywriter.h>
+#ifndef MOBIINFER_MNN
+#define MOBIINFER_MNN 0
+#endif
 #include "utils/InitNet.hpp"
+#if MOBIINFER_MNN == 0
 #include "core/Command.hpp"
 #include "geometry/GeometryComputer.hpp"
 #include "geometry/GeometryComputerUtils.hpp"
+#endif
 
 using namespace MNN;
 static bool gNeedOffline = false;
@@ -172,9 +177,12 @@ static std::vector<int> _collectNeededOps(const MNN::Net* net, const std::set<in
     return ops;
 }
 
+#if MOBIINFER_MNN == 0
 // Global set to store extra break op indexes (ops between attention_mask and Attention)
 static std::set<int> gExtraBreakOpIndexes;
+#endif
 
+#if MOBIINFER_MNN == 0
 // Find ops between attention_mask input and Attention/LinearAttention ops that should also be break ops
 static std::set<int> _findMaskToAttentionOps(const Net* net, const std::set<int>& inputIndexes,
                                              const std::set<int>& outputIndexes) {
@@ -309,8 +317,6 @@ static std::set<int> _findMaskToAttentionOps(const Net* net, const std::set<int>
     }
 
     return extraBreakOps;
-}
-
 static void _setInputOutputForOps(std::vector<std::shared_ptr<Tensor>>& allTensors, const std::vector<const Op*>& ops) {
     std::set<int> inputIndexes;
     std::set<int> outputIndexes;
@@ -541,6 +547,8 @@ static NetT* _replaceConstOp(const void* buffer, size_t bufferSize,
     // outputOs.write((const char*)builder.GetBufferPointer(), builder.GetSize());
 }
 
+#endif
+
 static std::vector<int> _findBreakIndex(const SubModuleInfo& info, const Net* net, std::shared_ptr<Schedule::ScheduleInfo> sharedConst) {
     // 0: not used, 1: const, 2: output
     std::vector<uint8_t> constMask(sharedConst->allTensors.size(), 0);
@@ -628,6 +636,7 @@ static std::vector<SubModuleInfo> _splitSubModuleForShapeConst(const std::vector
     return res;
 }
 
+#if MOBIINFER_MNN == 0
 static bool _needSplitNet(const Net* net, const std::set<int>& inputIndexes, const std::set<int>& outputIndexes) {
     auto selectOps = _collectNeededOps(net, inputIndexes, outputIndexes);
     for (int si = 0; si < selectOps.size(); ++si) {
@@ -639,6 +648,7 @@ static bool _needSplitNet(const Net* net, const std::set<int>& inputIndexes, con
     }
     return false;
 }
+#endif
 
 static std::vector<SubModuleInfo> _createSubModuleInfo(const Net* net, const std::set<int>& inputIndexes, const std::set<int>& outputIndexes, const std::set<int>& noComputeIndexes, std::shared_ptr<Schedule::ScheduleInfo> sharedConst) {
     std::vector<SubModuleInfo> submodule;
@@ -649,7 +659,11 @@ static std::vector<SubModuleInfo> _createSubModuleInfo(const Net* net, const std
     for (int si=0; si<selectOps.size(); ++si) {
         auto i = selectOps[si];
         auto op = net->oplists()->GetAs<Op>(i);
-        if (isBreakOp(op) || gExtraBreakOpIndexes.count(i) > 0) {
+        if (isBreakOp(op)
+#if MOBIINFER_MNN == 0
+            || gExtraBreakOpIndexes.count(i) > 0
+#endif
+        ) {
             // TODO: Don't need split segment
             if (current.opList.size() > 0) {
                 // Not empty
@@ -831,6 +845,7 @@ static SubModuleIO _getSubModuleIO(std::vector<MNN::Express::VARP> inputs, const
     return io;
 }
 
+#if MOBIINFER_MNN == 0
 static int _compileWholeModule(std::vector<std::string> inputNames, std::vector<std::string> outputNames,
                                std::vector<std::vector<MNN::Express::VARP>> inputs, const std::set<int>& inputIndexes,
                                const std::set<int>& outputIndexes, const void* buffer, size_t bufferSize,
@@ -1054,6 +1069,7 @@ static int _compileWholeModule(std::vector<std::string> inputNames, std::vector<
     os << buf.GetString();
     return 0;
 }
+#endif
 
 static std::unique_ptr<MNN::OpT> _compileSubModule(const SubModuleIO& io, SubModuleInfo& info, const void* buffer, size_t bufferSize, const std::string& path, std::string srcpath, const std::string& targetNpuPath, float& cpuTotal, float& npuTotal, int shapeIndex, std::string graphicName) {
     std::vector<std::string> inputNames(info.inputs.size());
@@ -1660,6 +1676,21 @@ int main(int argc, const char* argv[]) {
         inputNames = newInputNames;
     }
 
+#if MOBIINFER_MNN == 1
+    // === Old code path (clean_pr_branch): skip constant folding, use original net ===
+    std::vector<bool> keepOp(net->oplists()->size(), false);
+    {
+        auto subModulesInfo = _createSubModuleInfo(net, inputIndexes, outputIndexes, noneedComputeIndexes, sharedConst);
+        for (int moduleIndex = 0; moduleIndex < subModulesInfo.size(); ++moduleIndex) {
+            auto moduleInfo = subModulesInfo[moduleIndex];
+            for (auto& index : moduleInfo.opList) {
+                keepOp[index] = true;
+            }
+        }
+    }
+    const Net* effectiveNet = net;
+#else
+    // === New code path: constant folding + extra break ops ===
     // Find intermediate ops between attention_mask and Attention that should also be break ops
     gExtraBreakOpIndexes = _findMaskToAttentionOps(net, inputIndexes, outputIndexes);
 
@@ -1703,16 +1734,25 @@ int main(int argc, const char* argv[]) {
             }
         }
     }
+    const Net* effectiveNet = net0;
+#endif
 
     // Split Module
-    auto subModulesInfo = _createSubModuleInfo(net0, inputIndexes, outputIndexes, noneedComputeIndexes, sharedConst);
+    auto subModulesInfo = _createSubModuleInfo(effectiveNet, inputIndexes, outputIndexes, noneedComputeIndexes, sharedConst);
     // TODO: Insert pass to split submodule to npu and not npu
     std::map<std::string, std::vector<std::string>> merges;
     std::vector<std::shared_ptr<NetT>> allNets;
     for (int inputIndex=0; inputIndex < inputs.size(); ++inputIndex) {
-        auto bufferPairTmp =
+#if MOBIINFER_MNN == 1
+        const void* curBufPtr = bufferPair.first;
+        size_t curBufSize = bufferPair.second;
+#else
+        auto _tmpBufPair =
             std::make_pair(BuilderTmp[inputIndex].GetBufferPointer(), BuilderTmp[inputIndex].GetSize());
-        auto net = GetNet(bufferPairTmp.first);
+        const void* curBufPtr = _tmpBufPair.first;
+        size_t curBufSize = _tmpBufPair.second;
+#endif
+        auto net = GetNet(curBufPtr);
         std::map<int, MNN::Express::VARP> stackes;
         // Compute module's io
         for (int i=0; i<net->tensorName()->size(); ++i) {
@@ -1731,7 +1771,7 @@ int main(int argc, const char* argv[]) {
             for (auto index : current.inputs) {
                 subInputs.emplace_back(stackes[index]);
             }
-            moduleIO[i] = _getSubModuleIO(subInputs, current, bufferPairTmp.first, bufferPairTmp.second, srcMNN);
+            moduleIO[i] = _getSubModuleIO(subInputs, current, curBufPtr, curBufSize, srcMNN);
             for (int j=0; j<current.outputs.size(); ++j) {
                 stackes.insert(std::make_pair(current.outputs[j], moduleIO[i].outputs[j]));
             }
@@ -1781,15 +1821,15 @@ int main(int argc, const char* argv[]) {
                 } else {
                     merges.insert(std::make_pair(path, std::vector<std::string>{srcPath}));
                 }
-                npuOps[i] = std::move(_compileSubModule(moduleIO[i], subModulesInfo[i], bufferPairTmp.first,
-                                                        bufferPairTmp.second, srcPath, srcMNN, path, cpuTotal, npuTotal,
+                npuOps[i] = std::move(_compileSubModule(moduleIO[i], subModulesInfo[i], curBufPtr,
+                                                        curBufSize, srcPath, srcMNN, path, cpuTotal, npuTotal,
                                                         inputIndex, graphicName));
                 npuIndex++;
             }
         }
         MNN_PRINT("Total Speed Compare: NPU: %f ms : CPU: %f ms\n", npuTotal, cpuTotal);
         // Merge to dst
-        std::shared_ptr<MNN::NetT> dstNet(flatbuffers::GetRoot<Net>(bufferPairTmp.first)->UnPack());
+        std::shared_ptr<MNN::NetT> dstNet(flatbuffers::GetRoot<Net>(curBufPtr)->UnPack());
         for (int i=0; i<keepOp.size(); ++i) {
             if (dstNet->oplists[i]->inputIndexes.empty()) {
                 continue;

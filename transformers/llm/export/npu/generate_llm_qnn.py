@@ -171,7 +171,7 @@ if MOBIINFER_MNN:
         print("Cost: ", end - sta, ' s')
         sta = end
         print("Step2: Seperate Model")
-        seperate(args, model_name, ids)
+        seperate(args)
         end = time.time()
         print("Cost: ", end - sta, ' s')
         sta = end

@@ -28,6 +28,9 @@
 
 // 0: no debug, 1: test op time, 2: print tensor info, 3: print tensor in output
 #define DEBUG_MODE 0
+#ifndef MOBIINFER_MNN
+#define MOBIINFER_MNN 0
+#endif
 // #define DBG_DEEPSTACK
 //#define DEBUG_IMAGE
 
@@ -679,7 +682,7 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
     MNN::Express::ExecutorScope s(mExecutor);
     
     int seq_len         = input_embeds->getInfo()->dim[mSeqLenIndex];
-#ifdef MOBIINFER_MNN
+#if MOBIINFER_MNN == 1
     // Reset chunk window. Set per-chunk inside the loops below; default -1
     // signals "not chunked" so Omni::forwardRaw passes mExtraArgs through
     // unchanged (correct for single-shot prefill and pure decode).
@@ -696,7 +699,12 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         mMeta->add = seq_len;
         auto attention_mask = gen_attention_mask(seq_len);
         auto position_ids = gen_position_ids(seq_len);
+#if MOBIINFER_MNN == 1
+        auto res = forwardRaw(input_embeds, attention_mask, position_ids);
+
+#else
         auto res = forwardRaw(input_embeds, attention_mask, position_ids, extraArgs);
+#endif
         return res;
     }
     // For decode can't support seq_len <= mBlockSize
@@ -735,7 +743,7 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         auto embed = embeddings[i];
         auto attention_mask = gen_attention_mask(blockSize);
         auto position_ids = gen_position_ids(blockSize);
-#ifdef MOBIINFER_MNN
+#if MOBIINFER_MNN == 1
         // Tell forwardRaw which slice of the full mExtraArgs (deepstack) goes
         // with this chunk so QNN's [3, blockSize, H] baked input matches.
         mChunkStart = i * blockSize;
@@ -780,7 +788,7 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         }
         auto attention_mask = gen_attention_mask(forwardSize);
         auto position_ids = gen_position_ids(forwardSize);
-#ifdef MOBIINFER_MNN
+#if MOBIINFER_MNN == 1
         // Tail chunk follows the completed blockNumber * blockSize tokens.
         // Set mChunkSize = forwardSize (already padded to a baked-graph shape)
         // so the deepstack slice matches; mChunkStart = absolute offset.
@@ -1261,7 +1269,7 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
             prompt = user_content;
         }
     }
-#ifdef MOBIINFER_MNN
+#if MOBIINFER_MNN == 1
     // std::cout << "prompt: " << prompt << std::endl;
 #else
 #endif
