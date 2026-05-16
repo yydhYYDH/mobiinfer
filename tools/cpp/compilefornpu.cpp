@@ -317,6 +317,7 @@ static std::set<int> _findMaskToAttentionOps(const Net* net, const std::set<int>
     }
 
     return extraBreakOps;
+}
 static void _setInputOutputForOps(std::vector<std::shared_ptr<Tensor>>& allTensors, const std::vector<const Op*>& ops) {
     std::set<int> inputIndexes;
     std::set<int> outputIndexes;

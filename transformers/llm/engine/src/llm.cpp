@@ -762,6 +762,7 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
     }
     bool hasPad = false;
     if (blockRemain != 0) {
+        // printf("blockRemain %d\n", blockRemain);    
         logits.clear();
         mMeta->add = blockRemain;
         addSize = blockRemain;
@@ -1335,7 +1336,7 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
             token_split++;
         }
         std::vector<int> delta(full_tokens.begin() + token_split, full_tokens.end());
-        MNN_PRINT("[prompt_cache] cached=%d, compare=%d, common=%d, token_split=%d, delta=%d\n",
+        printf("[prompt_cache] cached=%d, compare=%d, common=%d, token_split=%d, delta=%d\n",
                   (int)mCachedPromptText.size(), (int)prompt_for_compare.size(), (int)text_common, (int)token_split,
                   (int)delta.size());
 

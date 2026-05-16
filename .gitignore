@@ -466,3 +466,5 @@ test_analyze_nonlinear.py
 
 # oneday scoder
 .oneday/
+
+vb*.json

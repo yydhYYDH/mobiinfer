@@ -44,10 +44,7 @@ ErrorCode NPUUnary::onResize(const std::vector<Tensor *> &inputs, const std::vec
         mNpuBackend->setOutputOps(mOp, {unary}, outputs);
     } else if (unary_type == UnaryOpOperation_TANH) {
         shared_ptr<hiai::op::Activation> unary(new hiai::op::Activation(opName));
-        (*unary)
-            .set_attr_coef(.000000)
-            .set_attr_negative_slope(0.0f)
-            .set_attr_mode(2);
+        (*unary).set_attr_mode(2);
         (*unary).set_input_x(*xOp.get());
         mNpuBackend->setOutputOps(mOp, {unary}, outputs);
     } else if (unary_type == UnaryOpOperation_SILU) {

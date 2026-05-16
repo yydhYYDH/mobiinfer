@@ -378,7 +378,11 @@ namespace MNN {
     public:
 
         map<int, vector<pair<shared_ptr<ge::Operator>, string>>> mGrapMap;
-        map<shared_ptr<ge::Operator>, MNNTensorList> mOutGEOpMap;
+        // Use ordered vector (insertion order) instead of std::map (pointer-sorted,
+        // non-deterministic order). The DDK output dimension list must match the order
+        // in which we call graph.SetOutputs(), otherwise mOutputTensors[i] will not
+        // correspond to mMNNOutTensors[i] when onCopyBuffer uses the same index.
+        vector<pair<shared_ptr<ge::Operator>, MNNTensorList>> mOutGEOpMap;
 
         map<int, std::vector<ge::Operator>> mInputOps;
 
@@ -429,6 +433,13 @@ namespace MNN {
         vector<shared_ptr<hiai::AiTensor>> mOutputTensors;
 
         MNNTensorList mMNNOutTensors;
+        // Map from tensor's Backend::MemObj (shared between original and clone) to
+        // the corresponding HiAI output tensor DDK slot index. Populated in
+        // getInOutTensorInfo by matching MNN tensors to DDK output slots by byte size,
+        // so that multiple same-shape MNN outputs can share one DDK buffer when the
+        // DDK merges them. Used in onCopyBuffer to match cloned tensors (whose raw
+        // Tensor* differs from the original) back to the correct NPU output buffer.
+        std::map<Backend::MemObj*, int> mOutputMemToIndex;
         const NPURuntime* mNPURuntime;
         BackendConfig::PrecisionMode mPrecision;
 #if HIAI_VERBOSE

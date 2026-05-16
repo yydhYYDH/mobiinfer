@@ -706,15 +706,20 @@ namespace MNN {
         } else if(isOutputCopy){
 #if MNN_HIAI_USE_LOCAL_NPU_FIXES
             int matchIndex = -1;
-            for(int i = 0; i < mMNNOutTensors.size(); i++) {
-                if(mMNNOutTensors[i] == srcTensor) {
-                    matchIndex = i;
-                    break;
+            // Primary: match by Backend::MemObj pointer, which is shared between
+            // the original pipeline tensor and any Tensor::clone() shallow copy.
+            // Raw Tensor* pointer comparison fails because StaticModule::onForward
+            // calls Tensor::clone() which creates a new Tensor object.
+            auto srcMem = TensorUtils::getDescribeOrigin(srcTensor)->mem.get();
+            if (srcMem != nullptr) {
+                auto iter = mOutputMemToIndex.find(srcMem);
+                if (iter != mOutputMemToIndex.end()) {
+                    matchIndex = iter->second;
                 }
             }
-            
-            // Fallback: MNN dynamic graph changes pointers. Try to recover by topology/size.
-            if(matchIndex == -1) {
+            // Last resort: size-based heuristic (may fail for same-shape outputs).
+            if (matchIndex == -1) {
+                MNN_HIAI_LOG("WARNNINGGG -> pointer comparison failed, fallback to size.");
                 if (mMNNOutTensors.size() == 1) {
                     matchIndex = 0;
                 } else {
@@ -725,11 +730,11 @@ namespace MNN {
                         }
                     }
                 }
-                
-                if(matchIndex == -1) {
-                    MNN_HIAI_LOG("  -> Cannot recover output mapping! Aborting copy.");
-                    return;
-                }
+            }
+            if (matchIndex == -1 || matchIndex >= (int)mOutputTensors.size()) {
+                MNN_HIAI_LOG("  -> Cannot recover output mapping (match=%d, npuOut=%zu)! Aborting copy.",
+                             matchIndex, mOutputTensors.size());
+                return;
             }
 
             shared_ptr<hiai::AiTensor> output = mOutputTensors[matchIndex];
@@ -791,6 +796,7 @@ namespace MNN {
         mInputTensors.clear();
         mOutputTensors.clear();
         mMNNOutTensors.clear();
+        mOutputMemToIndex.clear();
         mSclipMap.clear();
         mInputSqueezedAxes.clear();
 #if MNN_HIAI_USE_LOCAL_NPU_FIXES
@@ -835,7 +841,7 @@ namespace MNN {
             return -1;
         }
 
-        MNN_PRINT("mInputDimension : %lu , mOutputDimension : %lu \n", mInputDimension.size(), mOutputDimension.size());
+        MNN_HIAI_LOG("mInputDimension : %lu , mOutputDimension : %lu \n", mInputDimension.size(), mOutputDimension.size());
         MNN_HIAI_LOGV2("getInOutTensorInfo: npuInputs=%zu npuOutputs=%zu",
                      mInputDimension.size(), mOutputDimension.size());
 
@@ -914,24 +920,55 @@ namespace MNN {
         for (auto out_dim : mOutputDimension)
         {
             shared_ptr<hiai::AiTensor> output = make_shared<hiai::AiTensor>();
-            MNN_PRINT("%d HiAiTensor output DIM:%u,%u,%u,%u\n", index,
+            MNN_HIAI_LOG("%d HiAiTensor output DIM:%u,%u,%u,%u\n", index,
                       out_dim.GetNumber(), out_dim.GetChannel(),
                       out_dim.GetHeight(), out_dim.GetWidth());
             output->Init(&out_dim);
             mOutputTensors.push_back(output);
             index++;
         }
-        index = 0;
+        // Build mMNNOutTensors and match each MNN output tensor to a DDK output slot.
+        // We cannot assume 1:1 index correspondence because the DDK may produce a
+        // different number of outputs (e.g. when hidden_states and deepstack originate
+        // from the same DDK node, the DDK may merge them into one output buffer).
+        // Match by byte size: first pass prefers unmatched DDK slots, second pass
+        // reuses any matching slot so that same-shape MNN outputs can share one DDK buffer.
+
+        std::vector<bool> ddkSlotUsed(mOutputTensors.size(), false);
         for (auto opMap : mOutGEOpMap) {
             for (auto tensor : opMap.second) {
                 mMNNOutTensors.push_back(tensor);
-                MNN_PRINT("%d MNNTensor output DIM:%d,%d,%d,%d\n", index,
-                          tensor->batch(), tensor->channel(), tensor->height(), tensor->width());
-                index++;
+                int mnnBytes = tensor->elementSize() * sizeof(float);
+                int ddkSlot = -1;
+                // Pass 1: prefer an unmatched DDK slot with the same byte size.
+                for (int di = 0; di < (int)mOutputTensors.size(); di++) {
+                    if (!ddkSlotUsed[di] && (int)mOutputTensors[di]->GetSize() == mnnBytes) {
+                        ddkSlot = di;
+                        ddkSlotUsed[di] = true;
+                        break;
+                    }
+                }
+                // Pass 2: if no unmatched slot, reuse any slot with the same size
+                // (handles DDK merging same-shape outputs into one buffer).
+                if (ddkSlot == -1) {
+                    for (int di = 0; di < (int)mOutputTensors.size(); di++) {
+                        if ((int)mOutputTensors[di]->GetSize() == mnnBytes) {
+                            ddkSlot = di;
+                            break;
+                        }
+                    }
+                }
+                auto memPtr = TensorUtils::getDescribeOrigin(tensor)->mem.get();
+                if (memPtr != nullptr && ddkSlot >= 0) {
+                    mOutputMemToIndex[memPtr] = ddkSlot;
+                }
+                MNN_HIAI_LOG("%d MNNTensor output DIM:%d,%d,%d,%d -> ddkSlot=%d\n", index,
+                          tensor->batch(), tensor->channel(), tensor->height(), tensor->width(), ddkSlot);
+
             }
         }
         if (mOutputTensors.size() != mMNNOutTensors.size()) {
-            MNN_HIAI_LOG("getInOutTensorInfo: MISMATCH npuOutputs=%zu vs mnnOutputs=%zu (onCopyBuffer will error)",
+            MNN_HIAI_LOG("getInOutTensorInfo: MISMATCH npuOutputs=%zu vs mnnOutputs=%zu (same-shape outputs will share DDK buffer)",
                          mOutputTensors.size(), mMNNOutTensors.size());
         }
         return 0;
@@ -1206,8 +1243,9 @@ namespace MNN {
             }
         }
         if(!tensors.empty()) {
-            mOutGEOpMap.insert(make_pair(HIAI_op[HIAI_op.size()-1], tensors));
-            MNN_HIAI_LOG("  +terminal output(s) registered: count=%zu", tensors.size());
+            mOutGEOpMap.emplace_back(make_pair(HIAI_op[HIAI_op.size()-1], tensors));
+            MNN_HIAI_LOG("  +terminal output(s) registered: count=%zu (total outputs=%zu)",
+                         tensors.size(), mOutGEOpMap.size());
         }
     }
 
