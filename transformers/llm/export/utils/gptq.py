@@ -243,22 +243,34 @@ class VisualGPTQ(GPTQ):
             return None, None
 
     @staticmethod
-    def classify_visual_conv_ops(mnn_graph):
+    def classify_visual_conv_ops(mnn_graph, layer_offset=0):
         """Classify visual Convolution ops into semantic roles by analyzing naming patterns.
 
         Returns a list of VisualMNNWeight with correct layer_id and op_type.
-        Uses the naming convention from mnnconvert's transformerFuse output:
-          - /proj/ or /proj_{n}/  -> o_proj for block n (0-indexed, block 0 has no suffix)
+        Supports two naming conventions from mnnconvert's transformerFuse output:
+
+        Hierarchical (chunk/split ONNX without surrounding ViT context):
+          - /blocks.{N}/self_attn/q_proj/Add_output_0__matmul_converted -> attn.q
+          - /blocks.{N}/self_attn/k_proj/Add_output_0__matmul_converted -> attn.k
+          - /blocks.{N}/self_attn/v_proj/Add_output_0__matmul_converted -> attn.v
+          - /blocks.{N}/self_attn/proj/Add_output_0__matmul_converted -> attn.proj
+          - /blocks.{N}/mlp/linear_fc1/Add_output_0__matmul_converted -> mlp.linear_fc1
+          - /blocks.{N}/mlp/linear_fc2/Add_output_0__matmul_converted -> mlp.linear_fc2
+
+        Flat (monolithic ONNX with full ViT context):
+          - /proj/ or /proj_{n}/  -> o_proj for block n (block 0 has no suffix)
           - /mlp/linear_fc1/ or /mlp/linear_fc1_{n}/  -> fc1 for block n
           - /mlp/linear_fc2/ or /mlp/linear_fc2_{n}/  -> fc2 for block n
           - /Add_{N}_output_0__matmul_converted -> q/k/v (3 consecutive per block)
-          - /patch_embed/, /merger/, /deepstack_merger_list -> skipped
+
+        layer_offset is added to block indices from hierarchical naming, so chunk-relative
+        block indices are mapped to global GPTQ safetensor keys.
         """
         import re
         results = []
-        # Collect all Add_N matmul ops in order of N
+        # Collect all Add_N matmul ops in order of N (flat naming only)
         add_ops = []  # list of (N, op)
-        # Collect proj/fc ops
+        # Collect proj/fc ops (flat naming, keyed by suffix index)
         proj_ops = {}  # block_idx -> op
         fc1_ops = {}   # block_idx -> op
         fc2_ops = {}   # block_idx -> op
@@ -271,28 +283,61 @@ class VisualGPTQ(GPTQ):
             if '/patch_embed/' in name or '/merger/' in name or '/deepstack_merger' in name:
                 continue
 
-            # Match /proj/ or /proj_{n}/
+            external = op['main']['external']
+            ic = op['main']['common']['inputCount']
+            oc = op['main']['common']['outputCount']
+
+            # --- Hierarchical naming: /blocks.{N}/self_attn/{q_proj,k_proj,v_proj}/... ---
+            m = re.match(r'^/blocks\.(\d+)/self_attn/(q_proj|k_proj|v_proj)/', name)
+            if m:
+                block_idx = int(m.group(1)) + layer_offset
+                op_type = 'attn.' + m.group(2)[0]  # attn.q, attn.k, attn.v
+                results.append(VisualMNNWeight(name, external, ic * oc, block_idx, op_type))
+                continue
+
+            # --- Hierarchical naming: /blocks.{N}/self_attn/proj/... ---
+            m = re.match(r'^/blocks\.(\d+)/self_attn/proj/', name)
+            if m:
+                block_idx = int(m.group(1)) + layer_offset
+                results.append(VisualMNNWeight(name, external, ic * oc, block_idx, 'attn.proj'))
+                continue
+
+            # --- Hierarchical naming: /blocks.{N}/mlp/linear_fc1/... ---
+            m = re.match(r'^/blocks\.(\d+)/mlp/linear_fc1/', name)
+            if m:
+                block_idx = int(m.group(1)) + layer_offset
+                results.append(VisualMNNWeight(name, external, ic * oc, block_idx, 'mlp.linear_fc1'))
+                continue
+
+            # --- Hierarchical naming: /blocks.{N}/mlp/linear_fc2/... ---
+            m = re.match(r'^/blocks\.(\d+)/mlp/linear_fc2/', name)
+            if m:
+                block_idx = int(m.group(1)) + layer_offset
+                results.append(VisualMNNWeight(name, external, ic * oc, block_idx, 'mlp.linear_fc2'))
+                continue
+
+            # --- Flat naming: /proj/ or /proj_{n}/ ---
             m = re.match(r'^/proj(?:_(\d+))?/', name)
             if m:
                 idx = int(m.group(1)) if m.group(1) else 0
                 proj_ops[idx] = op
                 continue
 
-            # Match /mlp/linear_fc1/ or /mlp/linear_fc1_{n}/
+            # --- Flat naming: /mlp/linear_fc1/ or /mlp/linear_fc1_{n}/ ---
             m = re.match(r'^/mlp/linear_fc1(?:_(\d+))?/', name)
             if m:
                 idx = int(m.group(1)) if m.group(1) else 0
                 fc1_ops[idx] = op
                 continue
 
-            # Match /mlp/linear_fc2/ or /mlp/linear_fc2_{n}/
+            # --- Flat naming: /mlp/linear_fc2/ or /mlp/linear_fc2_{n}/ ---
             m = re.match(r'^/mlp/linear_fc2(?:_(\d+))?/', name)
             if m:
                 idx = int(m.group(1)) if m.group(1) else 0
                 fc2_ops[idx] = op
                 continue
 
-            # Match /Add_{N}_output_0__matmul_converted
+            # --- Flat naming: /Add_{N}_output_0__matmul_converted ---
             m = re.match(r'^/Add_(\d+)_output_0__matmul_converted$', name)
             if m:
                 add_n = int(m.group(1))
@@ -303,36 +348,35 @@ class VisualGPTQ(GPTQ):
         add_ops.sort(key=lambda x: x[0])
 
         # Group Add ops into blocks of 3 (q, k, v)
-        # Each block has exactly 3 Add matmul ops for q, k, v
         for group_idx in range(len(add_ops) // 3):
             block_idx = group_idx
             for qkv_offset, qkv_name in enumerate(['attn.q', 'attn.k', 'attn.v']):
                 _, op = add_ops[group_idx * 3 + qkv_offset]
-                external = op['main']['external']
-                ic = op['main']['common']['inputCount']
-                oc = op['main']['common']['outputCount']
-                results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, qkv_name))
+                ext = op['main']['external']
+                ic2 = op['main']['common']['inputCount']
+                oc2 = op['main']['common']['outputCount']
+                results.append(VisualMNNWeight(op['name'], ext, ic2 * oc2, block_idx, qkv_name))
 
-        # Add proj ops
+        # Add proj ops from flat naming
         for block_idx, op in sorted(proj_ops.items()):
-            external = op['main']['external']
-            ic = op['main']['common']['inputCount']
-            oc = op['main']['common']['outputCount']
-            results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, 'attn.proj'))
+            ext = op['main']['external']
+            ic2 = op['main']['common']['inputCount']
+            oc2 = op['main']['common']['outputCount']
+            results.append(VisualMNNWeight(op['name'], ext, ic2 * oc2, block_idx, 'attn.proj'))
 
-        # Add fc1 ops (key must match GPTQ safetensor: mlp.linear_fc1)
+        # Add fc1 ops from flat naming
         for block_idx, op in sorted(fc1_ops.items()):
-            external = op['main']['external']
-            ic = op['main']['common']['inputCount']
-            oc = op['main']['common']['outputCount']
-            results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, 'mlp.linear_fc1'))
+            ext = op['main']['external']
+            ic2 = op['main']['common']['inputCount']
+            oc2 = op['main']['common']['outputCount']
+            results.append(VisualMNNWeight(op['name'], ext, ic2 * oc2, block_idx, 'mlp.linear_fc1'))
 
-        # Add fc2 ops (key must match GPTQ safetensor: mlp.linear_fc2)
+        # Add fc2 ops from flat naming
         for block_idx, op in sorted(fc2_ops.items()):
-            external = op['main']['external']
-            ic = op['main']['common']['inputCount']
-            oc = op['main']['common']['outputCount']
-            results.append(VisualMNNWeight(op['name'], external, ic * oc, block_idx, 'mlp.linear_fc2'))
+            ext = op['main']['external']
+            ic2 = op['main']['common']['inputCount']
+            oc2 = op['main']['common']['outputCount']
+            results.append(VisualMNNWeight(op['name'], ext, ic2 * oc2, block_idx, 'mlp.linear_fc2'))
 
         return results
 
@@ -373,7 +417,7 @@ class VisualGPTQ(GPTQ):
 
         return header_bytes, weight_bytes, scale_bytes, oc, ic, shape_dtype == np.int32
 
-    def apply(self, graph_path, weight_path, quant_block=128):
+    def apply(self, graph_path, weight_path, quant_block=128, layer_offset=0):
         """Replace visual model block weights with GPTQ quantized weights, keep merger/deepstack as fp16.
 
         Auto-detects both:
@@ -388,9 +432,12 @@ class VisualGPTQ(GPTQ):
 
         quant_block parameter is retained for API compatibility but ignored — the
         actual group layout is dictated by the GPTQ scales shape.
+
+        layer_offset is added to block indices from hierarchical naming so
+        chunk-relative indices map to global GPTQ safetensor keys.
         """
         mnn_graph = json.load(open(graph_path, 'rt'))
-        block_weights = self.classify_visual_conv_ops(mnn_graph)
+        block_weights = self.classify_visual_conv_ops(mnn_graph, layer_offset)
 
         # Build a lookup: op_name -> (VisualMNNWeight, gptq_data)
         block_gptq_map = {}

@@ -926,7 +926,7 @@ class LlmExporter(torch.nn.Module):
             # hidden_states input. rotary_pos_emb and attention_mask are reused.
             last_hidden = hidden_states
             global_ds_cursor = 0
-            chunk_onnx_paths = []
+            chunk_onnx_paths = []  # (onnx_path, start_layer)
             for (s, e, fname, _is_cpu_tail) in chunk_specs:
                 chunk_module, local_ds_idx = self._build_visual_blocks_chunk(
                     s, e, meta['has_deepstack'], meta['deepstack_indexes'])
@@ -954,7 +954,7 @@ class LlmExporter(torch.nn.Module):
                             input_names=['hidden_states_in', 'rotary_pos_emb', 'attention_mask'],
                             output_names=out_names,
                             dynamic_axes=dyn)
-                chunk_onnx_paths.append(chunk_onnx)
+                chunk_onnx_paths.append((chunk_onnx, s))
 
                 # Dry-run to propagate hidden_states into the next chunk.
                 # ViT blocks are shape-preserving, so this only fixes input
@@ -965,12 +965,15 @@ class LlmExporter(torch.nn.Module):
                 global_ds_cursor += len(local_ds_idx)
 
             if self.mnn_converter:
-                for p in chunk_onnx_paths:
-                    self._convert_visual_piece(p)
+                for p, s in chunk_onnx_paths:
+                    self._convert_visual_piece(p, layer_offset=s)
 
-    def _convert_visual_piece(self, onnx_path):
+    def _convert_visual_piece(self, onnx_path, layer_offset=0):
         """Route a single visual-split onnx file through whichever MNN conversion
-        path the user asked for (same flags as the non-split export_vision)."""
+        path the user asked for (same flags as the non-split export_vision).
+
+        layer_offset is the global start index of the first block in this chunk,
+        so GPTQ safetensor lookups use global (not chunk-relative) block indices."""
         fuse_transformer = self.visual.transformer_fuse
         native_group_conv = self.visual.group_conv_native
         quant_bit_visual = self.visual.quant_bit
@@ -1000,6 +1003,7 @@ class LlmExporter(torch.nn.Module):
                 transformer_fuse=fuse_transformer,
                 group_conv_native=native_group_conv,
                 weight_sym=self.args.visual_sym,
+                layer_offset=layer_offset,
             )
         else:
             self.mnn_converter.export(
