@@ -66,6 +66,7 @@ export LD_LIBRARY_PATH=/root/qnn-mirror/lib/x86_64-linux-clang:$LD_LIBRARY_PATH 
 
 ```bash
 cd /workspace/mobiinfer/transformers/llm/export/npu
+export MOBIINFER_MNN=1
 python3 generate_llm_qnn.py \
   --model ../model \
   --target llm --chunk_size 128 --max_history_token 2048 \
@@ -79,10 +80,11 @@ python3 generate_llm_qnn.py \
 
 ```bash
 cd /workspace/mobiinfer/build_qnn_x86
+mkdir -p /workspace/mobiinfer/transformers/llm/export/model/qnn_visual
 ./MNN2QNNModel /opt/qnn 69 79 \
   /workspace/mobiinfer/transformers/llm/export/model/visual_blocks.mnn \
   /workspace/mobiinfer/transformers/llm/export/model/qnn_visual \
-  1 608x1024_2x1x608x1x64_1x608x60
+  1 608x1024_2x1x608x1x64_1x608x608
 ```
 
 这一步用于生成固定图片 shape 的 QNN bin。

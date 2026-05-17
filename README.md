@@ -56,6 +56,7 @@ cmake .. \
   -DMNN_QNN_CONVERT_MODE=ON \
   -DMNN_WITH_PLUGIN=OFF \
   -DMNN_BUILD_TOOLS=ON \
+  -DMOBIINFER_MNN=ON \
   -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
 
 make -j64
@@ -81,6 +82,7 @@ cd build
   -DMNN_IMGCODECS=true \
   -DMNN_QNN=ON \
   -DMNN_WITH_PLUGIN=ON \
+  -DMOBIINFER_MNN=ON \
   -DMNN_QNN_CONVERT_MODE=OFF
 ```
 
@@ -169,7 +171,7 @@ cd ${PHONEDIR}
   "visual_pre_model": "visual_pre.mnn",
   "visual_blocks_model": "visual_blocks_69_79.mnn",
   "visual_post_model": "visual_post.mnn",
-  "visual_blocks_backend_type": "npu"
+  "visual_blocks_backend_type": "cpu"
 }
 ```
 
