@@ -468,3 +468,19 @@ test_analyze_nonlinear.py
 .oneday/
 
 vb*.json
+
+
+transformers/llm/export/apply_gptq_to_onnx.py
+transformers/llm/export/export_visual_onnx.py
+transformers/llm/export/export_visual_onnxv2.py
+transformers/llm/export/export_visual_onnxv3.py
+transformers/llm/export/export_visual_onnxv4.py
+transformers/llm/export/export_visual_onnxv5.py
+transformers/llm/export/log2.txt
+transformers/llm/export/log6.txt
+transformers/llm/export/logv3.txt
+transformers/llm/export/logv4.txt
+transformers/llm/export/logv5.txt
+transformers/llm/export/run_omc_convert_visual.sh
+transformers/llm/export/run_omc_convert_visualv3.sh
+transformers/llm/export/run_visual_blocks_pipeline.sh
