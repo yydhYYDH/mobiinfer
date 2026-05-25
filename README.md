@@ -1,4 +1,4 @@
-# Qwen3-VL 在高通 NPU / 麒麟 NPU 上运行说明
+# Mobiinfer -- 端侧执行（高通 NPU / 麒麟 NPU ）多模态大模型
 
 本文档说明如何在 mobiinfer 中准备并运行 Qwen3-VL。
 
