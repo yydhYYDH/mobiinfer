@@ -9,6 +9,7 @@
 #define OMNI_hpp
 
 #include "llm/llm.hpp"
+#include "llm/npu_chunk_executor.hpp"
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -173,6 +174,13 @@ public:
     std::vector<int> smolvlmVisionProcess(VARP image);
     std::vector<int> minicpmVisionProcess(VARP image);
     std::vector<int> gemma4VisionProcess(VARP image);
+    // Inject an external NPU chunk executor (HarmonyOS OM path).
+    // omPaths: per-chunk .om file paths, aligned with visual_blocks_chunks.
+    void setNpuChunkExecutor(std::shared_ptr<INpuChunkExecutor> executor,
+                             const std::vector<std::string>& omPaths) {
+        mNpuChunkExecutor = std::move(executor);
+        mNpuChunkOmPaths = omPaths;
+    }
 private:
     int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857,
         mVisionEnd = 151858, mVisionPad = 151859, mAudioPad = 151646,
@@ -205,6 +213,10 @@ private:
     // Takes priority over mVisionBlocksNpuModule / mVisionBlocksCpuModule and
     // over mVisionBlocksModule when non-empty.
     std::vector<std::shared_ptr<Module>> mVisionBlocksChunkModules;
+    // Pluggable NPU executor: when set (by HarmonyOS app), chunk inference
+    // routes through OM files via INpuChunkExecutor instead of MNN Modules.
+    std::shared_ptr<INpuChunkExecutor> mNpuChunkExecutor;
+    std::vector<std::string> mNpuChunkOmPaths;
     std::shared_ptr<Executor::RuntimeManager> mVisionBlocksRuntimeManager;
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;
