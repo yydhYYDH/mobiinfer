@@ -10,6 +10,7 @@
 
 #include "llm/llm.hpp"
 #include "llm/npu_chunk_executor.hpp"
+#include <set>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -216,7 +217,9 @@ private:
     // Pluggable NPU executor: when set (by HarmonyOS app), chunk inference
     // routes through OM files via INpuChunkExecutor instead of MNN Modules.
     std::shared_ptr<INpuChunkExecutor> mNpuChunkExecutor;
-    std::vector<std::string> mNpuChunkOmPaths;
+    std::vector<std::string> mNpuChunkOmPaths;  // sparse: omPaths[i]=="" means MNN fallback
+    std::vector<bool> mChunkUseOm;               // per-chunk: true → OM, false → MNN Module
+    std::set<int> mOmDeepstackDupIndices;        // chunk indices where OM output[0] → deepstack
     std::shared_ptr<Executor::RuntimeManager> mVisionBlocksRuntimeManager;
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;

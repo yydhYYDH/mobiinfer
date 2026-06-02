@@ -44,6 +44,9 @@ namespace Transformer {
 #ifndef MNN_HIAI_CACHE_OM_BY_CHUNK
 #define MNN_HIAI_CACHE_OM_BY_CHUNK 0
 #endif
+#ifndef VISUAL_CHUNK_DUMP_OUTPUT
+#define VISUAL_CHUNK_DUMP_OUTPUT 0
+#endif
 
 namespace {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -379,53 +382,71 @@ bool Omni::load() {
                         }
                     }
                 }
-                // OM path: when an external NPU executor is injected (HarmonyOS),
-                // load chunks through it instead of creating MNN Module objects.
-                if (mNpuChunkExecutor && !mNpuChunkOmPaths.empty()) {
-                    if (mNpuChunkOmPaths.size() != chunkPaths.size()) {
-                        MNN_ERROR("mNpuChunkOmPaths size (%zu) != chunkPaths size (%zu)\n",
-                                  mNpuChunkOmPaths.size(), chunkPaths.size());
+
+                // Build per-chunk OM map from the sparse executor path array.
+                // mChunkUseOm[i] is true when a .om file exists AND the executor is set.
+                mChunkUseOm.resize(chunkPaths.size(), false);
+                if (mNpuChunkExecutor) {
+                    for (size_t i = 0; i < chunkPaths.size() && i < mNpuChunkOmPaths.size(); i++) {
+                        if (chunkRunOnNpu[i] && !mNpuChunkOmPaths[i].empty()) {
+                            if (!mNpuChunkExecutor->loadChunk((int)i, mNpuChunkOmPaths[i])) {
+                                MNN_ERROR("OM chunk[%zu] load failed: %s\n",
+                                          i, mNpuChunkOmPaths[i].c_str());
+                                return false;
+                            }
+                            mChunkUseOm[i] = true;
+                        }
+                    }
+                }
+
+                // Per-chunk OM deepstack duplication: when an OM model consolidates
+                // hidden==deepstack into one output, the config lists which chunk
+                // indices need output[0] duplicated as a deepstack entry.
+                mOmDeepstackDupIndices.clear();
+                if (mConfig->config_.contains("visual_blocks_om_deepstack_dup")) {
+                    auto dupArr = mConfig->config_["visual_blocks_om_deepstack_dup"];
+                    if (dupArr.is_array()) {
+                        for (size_t j = 0; j < dupArr.size(); j++) {
+                            if (dupArr[j].is_number_integer()) {
+                                int idx = dupArr[j].get<int>();
+                                if (idx >= 0 && idx < (int)chunkPaths.size()) {
+                                    mOmDeepstackDupIndices.insert(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Load MNN Modules for chunks that do NOT use OM.
+                mVisionBlocksChunkModules.resize(chunkPaths.size());
+                const auto npuCacheBaseDir = mConfig->npu_model_dir();
+                for (size_t i = 0; i < chunkPaths.size(); i++) {
+                    if (mChunkUseOm[i]) continue;   // OM handles this chunk
+                    auto targetRuntime = chunkRunOnNpu[i] ? mVisionBlocksRuntimeManager : mProcessorRuntimeManager;
+                    auto targetModuleCfg = chunkRunOnNpu[i] ? &npuModuleCfg : &module_config;
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+                    if (chunkRunOnNpu[i] && !npuCacheBaseDir.empty()) {
+                        auto chunkNpuDir = npuCacheBaseDir + "/chunk_" + std::to_string(i);
+                        mVisionBlocksRuntimeManager->setExternalPath(
+                            chunkNpuDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                    }
+#endif
+                    std::shared_ptr<Module> mod(Module::load(
+                        {}, {}, chunkPaths[i].c_str(),
+                        targetRuntime, targetModuleCfg));
+                    if (nullptr == mod.get()) {
+                        MNN_ERROR("visual_blocks chunk[%zu] load failed: %s\n",
+                                  i, chunkPaths[i].c_str());
                         return false;
                     }
-                    for (size_t i = 0; i < mNpuChunkOmPaths.size(); i++) {
-                        if (!mNpuChunkExecutor->loadChunk((int)i, mNpuChunkOmPaths[i])) {
-                            MNN_ERROR("OM chunk[%zu] load failed: %s\n",
-                                      i, mNpuChunkOmPaths[i].c_str());
-                            return false;
-                        }
-                    }
-                    // mVisionBlocksChunkModules stays empty; forward path uses
-                    // mNpuChunkExecutor branch instead.
-                } else {
-                    mVisionBlocksChunkModules.reserve(chunkPaths.size());
-                    const auto npuCacheBaseDir = mConfig->npu_model_dir();
-                    for (size_t i = 0; i < chunkPaths.size(); i++) {
-                        auto targetRuntime = chunkRunOnNpu[i] ? mVisionBlocksRuntimeManager : mProcessorRuntimeManager;
-                        auto targetModuleCfg = chunkRunOnNpu[i] ? &npuModuleCfg : &module_config;
-#if MNN_HIAI_CACHE_OM_BY_CHUNK
-                        if (chunkRunOnNpu[i] && !npuCacheBaseDir.empty()) {
-                            auto chunkNpuDir = npuCacheBaseDir + "/chunk_" + std::to_string(i);
-                            mVisionBlocksRuntimeManager->setExternalPath(
-                                chunkNpuDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
-                        }
-#endif
-                        std::shared_ptr<Module> mod(Module::load(
-                            {}, {}, chunkPaths[i].c_str(),
-                            targetRuntime, targetModuleCfg));
-                        if (nullptr == mod.get()) {
-                            MNN_ERROR("visual_blocks chunk[%zu] load failed: %s\n",
-                                      i, chunkPaths[i].c_str());
-                            return false;
-                        }
-                        mVisionBlocksChunkModules.push_back(mod);
-                    }
-#if MNN_HIAI_CACHE_OM_BY_CHUNK
-                    if (!npuCacheBaseDir.empty()) {
-                        mVisionBlocksRuntimeManager->setExternalPath(
-                            npuCacheBaseDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
-                    }
-#endif
+                    mVisionBlocksChunkModules[i] = mod;
                 }
+#if MNN_HIAI_CACHE_OM_BY_CHUNK
+                if (!npuCacheBaseDir.empty()) {
+                    mVisionBlocksRuntimeManager->setExternalPath(
+                        npuCacheBaseDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                }
+#endif
             } else if (mConfig->visual_npu_layers() > 0) {
                 mVisionBlocksNpuModule.reset(Module::load(
                     {}, {}, mConfig->visual_blocks_npu_model().c_str(),
@@ -869,107 +890,109 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
         // printf("--------------------------------------------------\n\n");
 
         VARPS blocksOut;
-        if (mNpuChunkExecutor && !mNpuChunkOmPaths.empty()) {
-            // OM path: each chunk runs through the injected HarmonyOS NPU executor.
-            // VARP inputs are marshalled to flat float vectors, OM runs via
-            // HIAIModelManager, and outputs are marshalled back to host VARPs.
-            printf("[OM] vision forward: %zu OM chunk(s)\n", mNpuChunkOmPaths.size());
-            fflush(stdout);
+        // Unified chunk loop: each chunk may run on OM (via INpuChunkExecutor)
+        // or MNN (via mVisionBlocksChunkModules[i]->onForward).  VARP ↔ float
+        // bridging at OM boundaries uses varpToFloatVector / floatVectorToVarp,
+        // so the handoff to the next chunk (of either kind) is seamless.
+        if (!mVisionBlocksChunkModules.empty() ||
+            (!mChunkUseOm.empty() && std::any_of(mChunkUseOm.begin(), mChunkUseOm.end(),
+                                                  [](bool v) { return v; }))) {
+            const size_t totalChunks = mVisionBlocksChunkModules.size();
             VARP curHidden = preOut[0];
             VARPS allDeepstack;
-            const size_t omChunkCount = mNpuChunkOmPaths.size();
-            for (size_t i = 0; i < omChunkCount; i++) {
-                // Marshal VARP inputs to flat float vectors.
-                std::vector<float> hiddenVec, rotaryVec, maskVec;
-                if (!varpToFloatVector(curHidden, hiddenVec) ||
-                    !varpToFloatVector(preOut[1], rotaryVec) ||
-                    !varpToFloatVector(attention_mask, maskVec)) {
-                    MNN_ERROR("[om-chunk] chunk[%zu] input marshal failed\n", i);
-                    return std::vector<int>(0);
+            for (size_t i = 0; i < totalChunks; i++) {
+                const size_t dsBefore = allDeepstack.size();
+                if (i < mChunkUseOm.size() && mChunkUseOm[i]) {
+                    // ------ OM chunk ------
+                    std::vector<float> hiddenVec, rotaryVec, maskVec;
+                    if (!varpToFloatVector(curHidden, hiddenVec) ||
+                        !varpToFloatVector(preOut[1], rotaryVec) ||
+                        !varpToFloatVector(attention_mask, maskVec)) {
+                        MNN_ERROR("[om-chunk] chunk[%zu] input marshal failed\n", i);
+                        return std::vector<int>(0);
+                    }
+                    std::vector<std::vector<float>> omOutputs;
+                    if (!mNpuChunkExecutor->runChunk((int)i, hiddenVec, rotaryVec, maskVec, omOutputs)) {
+                        MNN_ERROR("[om-chunk] chunk[%zu] run failed\n", i);
+                        return std::vector<int>(0);
+                    }
+                    if (omOutputs.empty()) {
+                        MNN_ERROR("[om-chunk] chunk[%zu] returned empty output\n", i);
+                        return std::vector<int>(0);
+                    }
+                    auto inInfo = curHidden->getInfo();
+                    std::vector<int> dims(inInfo->dim.begin(), inInfo->dim.end());
+                    auto nextHidden = floatVectorToVarp(omOutputs[0], dims,
+                                                        "vision_chunk_om_hidden_bridge");
+                    if (nextHidden.get() == nullptr) {
+                        MNN_ERROR("[om-chunk] chunk[%zu] output->VARP failed\n", i);
+                        return std::vector<int>(0);
+                    }
+                    (void)nextHidden->readMap<void>();
+                    curHidden = nextHidden;
+                    // OM model merged hidden==deepstack into one output:
+                    // duplicate output[0] as deepstack when config marks this chunk.
+                    if (mOmDeepstackDupIndices.count((int)i) && omOutputs.size() <= 1) {
+                        auto dsCopy = floatVectorToVarp(omOutputs[0], dims,
+                                                        "vision_chunk_om_deepstack_bridge");
+                        (void)dsCopy->readMap<void>();
+                        allDeepstack.push_back(dsCopy);
+                    }
+                    for (size_t j = 1; j < omOutputs.size(); j++) {
+                        auto dsVarp = floatVectorToVarp(omOutputs[j], dims,
+                                                        "vision_chunk_om_deepstack_bridge");
+                        (void)dsVarp->readMap<void>();
+                        allDeepstack.push_back(dsVarp);
+                    }
+                } else {
+                    // ------ MNN Module chunk ------
+                    VARPS chunkIn = {curHidden, preOut[1], attention_mask};
+                    auto in0 = chunkIn[0]->readMap<void>();
+                    auto in1 = chunkIn[1]->readMap<void>();
+                    auto in2 = chunkIn[2]->readMap<void>();
+                    if (in0 == nullptr || in1 == nullptr || in2 == nullptr) {
+                        MNN_ERROR("[vision-chunk] chunk[%zu] input host null: in0=%p in1=%p in2=%p "
+                                  "shape0=[%s] shape1=[%s] shape2=[%s]\n",
+                                  i, in0, in1, in2,
+                                  varShapeString(chunkIn[0]).c_str(),
+                                  varShapeString(chunkIn[1]).c_str(),
+                                  varShapeString(chunkIn[2]).c_str());
+                    }
+                    auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
+                    if (chunkOut.empty()) {
+                        MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
+                        return std::vector<int>(0);
+                    }
+                    curHidden = makeHostBridgeVar(chunkOut[0], "vision_chunk_hidden_bridge");
+                    (void)curHidden->readMap<void>();
+                    for (size_t j = 1; j < chunkOut.size(); j++) {
+                        (void)chunkOut[j]->readMap<void>();
+                        allDeepstack.push_back(makeHostBridgeVar(chunkOut[j], "vision_chunk_deepstack_bridge"));
+                    }
                 }
-                // Run through OM executor.
-                std::vector<std::vector<float>> omOutputs;
-                if (!mNpuChunkExecutor->runChunk((int)i, hiddenVec, rotaryVec, maskVec, omOutputs)) {
-                    MNN_ERROR("[om-chunk] chunk[%zu] run failed\n", i);
-                    return std::vector<int>(0);
+#if VISUAL_CHUNK_DUMP_OUTPUT
+                {
+                    auto ptr = curHidden->readMap<float>();
+                    auto info = curHidden->getInfo();
+                    int total = info ? info->size : 0;
+                    int n = std::min(10, total);
+                    printf("[DUMP] chunk %zu hidden_states  total=%d  first%d=[", i, total, n);
+                    for (int k = 0; k < n; k++) printf("%s%.6f", k ? ", " : "", ptr[k]);
+                    printf("]\n");
+                    fflush(stdout);
+                    for (size_t j = dsBefore; j < allDeepstack.size(); j++) {
+                        auto dp = allDeepstack[j]->readMap<float>();
+                        auto di = allDeepstack[j]->getInfo();
+                        int dt = di ? di->size : 0;
+                        int dn = std::min(10, dt);
+                        printf("[DUMP] chunk %zu deepstack_%zu  total=%d  first%d=[",
+                               i, j - dsBefore, dt, dn);
+                        for (int k = 0; k < dn; k++) printf("%s%.6f", k ? ", " : "", dp[k]);
+                        printf("]\n");
+                        fflush(stdout);
+                    }
                 }
-                if (omOutputs.empty()) {
-                    MNN_ERROR("[om-chunk] chunk[%zu] returned empty output\n", i);
-                    return std::vector<int>(0);
-                }
-                // Marshal OM output back to VARP. Use the input hidden shape
-                // (visual block preserves feature dimensions).
-                auto inInfo = curHidden->getInfo();
-                std::vector<int> hiddenDims(inInfo->dim.begin(), inInfo->dim.end());
-                auto nextHidden = floatVectorToVarp(omOutputs[0], hiddenDims,
-                                                    "vision_chunk_om_hidden_bridge");
-                if (nextHidden.get() == nullptr) {
-                    MNN_ERROR("[om-chunk] chunk[%zu] output->VARP failed\n", i);
-                    return std::vector<int>(0);
-                }
-                (void)nextHidden->readMap<void>();
-                curHidden = nextHidden;
-                // Deepstack outputs. When the OM model consolidates hidden==deepstack
-                // (last chunk, only 1 output), duplicate output[0] as the deepstack entry.
-                const bool isLastOmChunk = (i + 1 == omChunkCount);
-                if (isLastOmChunk && omOutputs.size() <= 1) {
-                    // Deepstack == hidden_states; push a copy.
-                    auto dsCopy = floatVectorToVarp(omOutputs[0], hiddenDims,
-                                                    "vision_chunk_om_deepstack_bridge");
-                    (void)dsCopy->readMap<void>();
-                    allDeepstack.push_back(dsCopy);
-                }
-                for (size_t j = 1; j < omOutputs.size(); j++) {
-                    auto dsVarp = floatVectorToVarp(omOutputs[j], hiddenDims,
-                                                    "vision_chunk_om_deepstack_bridge");
-                    (void)dsVarp->readMap<void>();
-                    allDeepstack.push_back(dsVarp);
-                }
-            }
-            blocksOut.reserve(1 + allDeepstack.size());
-            blocksOut.push_back(curHidden);
-            for (auto& d : allDeepstack) blocksOut.push_back(d);
-        } else if (!mVisionBlocksChunkModules.empty()) {
-            // K-chunk NPU split: chain each chunk's hidden_states output into the
-            // next chunk's input; rotary_pos_emb and attention_mask are reused.
-            // Deepstack outputs from each chunk are appended in chunk order,
-            // which matches the GLOBAL deepstack ordering the post module
-            // expects (export side names them deepstack_hidden_0 .. _{M-1}).
-            VARP curHidden = preOut[0];
-            VARPS allDeepstack;
-            for (size_t i = 0; i < mVisionBlocksChunkModules.size(); i++) {
-                VARPS chunkIn = {curHidden, preOut[1], attention_mask};
-                // Mixed CPU/NPU chunk routing requires explicit host-side materialize
-                // before each chunk run.
-                auto in0 = chunkIn[0]->readMap<void>();
-                auto in1 = chunkIn[1]->readMap<void>();
-                auto in2 = chunkIn[2]->readMap<void>();
-                if (in0 == nullptr || in1 == nullptr || in2 == nullptr) {
-                    MNN_ERROR("[vision-chunk] chunk[%zu] input host null: in0=%p in1=%p in2=%p "
-                              "shape0=[%s] shape1=[%s] shape2=[%s]\n",
-                              i, in0, in1, in2,
-                              varShapeString(chunkIn[0]).c_str(),
-                              varShapeString(chunkIn[1]).c_str(),
-                              varShapeString(chunkIn[2]).c_str());
-                }
-                auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
-                if (chunkOut.empty()) {
-                    MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
-                    return std::vector<int>(0);
-                }
-                // Bridge NPU output through an explicit host-backed VARP before
-                // feeding the next chunk, to avoid src.host==NULL in onCopyBuffer.
-                curHidden = makeHostBridgeVar(chunkOut[0], "vision_chunk_hidden_bridge");
-                // Each HiAI model has isolated ION I/O buffers, so chunk-to-chunk
-                // handoff must go through a host copy. Express allocates the host
-                // intermediate lazily; force materialize every chunk output to host
-                // here so the next chunk (or the CPU post-module) sees a populated
-                // host buffer and does not crash in NPUBackend::onCopyBuffer.
-                (void)curHidden->readMap<void>();
-                for (size_t j = 1; j < chunkOut.size(); j++) {
-                    (void)chunkOut[j]->readMap<void>();
-                    allDeepstack.push_back(makeHostBridgeVar(chunkOut[j], "vision_chunk_deepstack_bridge"));
-                }
+#endif
             }
             blocksOut.reserve(1 + allDeepstack.size());
             blocksOut.push_back(curHidden);
