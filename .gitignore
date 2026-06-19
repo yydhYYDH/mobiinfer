@@ -484,3 +484,17 @@ transformers/llm/export/logv5.txt
 transformers/llm/export/run_omc_convert_visual.sh
 transformers/llm/export/run_omc_convert_visualv3.sh
 transformers/llm/export/run_visual_blocks_pipeline.sh
+
+
+taobao1.jpg
+transformers/llm/export/onnx_dopt_visual_route_v1/
+transformers/llm/export/onnx_omc.md
+transformers/llm/export/onnx_omc2.md
+transformers/llm/export/onnx_omc2_conv_gemm_probe_v1/
+transformers/llm/export/onnx_omc2_resnet50_route_v1/
+transformers/llm/export/plugin_quant.md
+transformers/llm/export/plugin_quant_visual_gemm_route_v1/
+transformers/llm/export/plugin_quant_visual_matmul_all_blocks_route_v1/
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/
+transformers/llm/export/plugin_quant_visual_route_v1/
+transformers/llm/export/pytorch_visual_omc6_route_v1/

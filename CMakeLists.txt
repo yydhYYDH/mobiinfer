@@ -83,6 +83,7 @@ option(MNN_SME2 "Use Arm sme2 instructions" ON)
 option(MNN_METAL_TENSOR "Use Metal4 tensor instructions" ON)
 option(MNN_HIAI_CACHE_OM_BY_CHUNK "Enable chunk-aware OM cache path for HiAI backend" OFF)
 option(HIAI_VERBOSE "Enable HiAI verbose log" OFF )
+option(VISUAL_CHUNK_DUMP_OUTPUT "Dump first 10 values of visual chunk hidden_states and deepstack" OFF)
 option(MNN_GENERATE_PODSPEC "Generate iOS podspec file from CMake configuration" OFF)
 option(MOBIINFER_MNN "Enable MobiInfer MNN mode" OFF)
 
@@ -253,6 +254,9 @@ endif()
 
 if(HIAI_VERBOSE)
     add_definitions(-DHIAI_VERBOSE=1)
+endif()
+if(VISUAL_CHUNK_DUMP_OUTPUT)
+    add_definitions(-DVISUAL_CHUNK_DUMP_OUTPUT=1)
 endif()
 
 # debug options

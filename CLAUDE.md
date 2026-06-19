@@ -95,3 +95,7 @@ For the following tasks, **read the Skill entry file first** and execute step by
 | Add new op | `skills/add-new-op/SKILL.md` | Add a new operator |
 | ARM CPU optimization | `skills/arm-cpu-optimize/SKILL.md` | Optimize op performance on ARM CPU |
 | Retrospective | `skills/retrospective/SKILL.md` | After any non-trivial task: reflect on mistakes, update relevant skills with lessons learned |
+
+
+## 端侧鸿蒙app代买库
+mobiinfra-oh 这个目录下面是端侧推理的deveco 的项目代码库，主要的程序文件在mobiinfra-oh/entry/src/main/cpp目录下面，这里mobiinfra-oh/entry/libs/arm64-v8a/libMNN.so这个so文件是project/harmony/build_oh/libMNN.so拷贝过去的
