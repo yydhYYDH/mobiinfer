@@ -498,3 +498,4 @@ transformers/llm/export/plugin_quant_visual_matmul_all_blocks_route_v1/
 transformers/llm/export/plugin_quant_visual_matmul_route_v1/
 transformers/llm/export/plugin_quant_visual_route_v1/
 transformers/llm/export/pytorch_visual_omc6_route_v1/
+transformers/llm/export/discarded_omg_convert/

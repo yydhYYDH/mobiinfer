@@ -45,6 +45,14 @@ endif()
 # jinja.cpp template engine (always enabled, header-only)
 target_compile_definitions(llm PRIVATE LLM_USE_JINJA)
 
+# When MNN_VISUAL_CHUNK_INPUT_DUMP is ON, the omni visual chunk path can dump the
+# real per-chunk calibration inputs (hidden_states / rotary_pos_emb / attention_mask)
+# to disk for HiAI NPU OM quantization calibration. Default OFF: the engine keeps
+# its original behavior with no extra code paths active.
+if (MNN_VISUAL_CHUNK_INPUT_DUMP)
+    target_compile_definitions(llm PRIVATE MNN_VISUAL_CHUNK_INPUT_DUMP)
+endif()
+
 # apply_template demo (uses jinja)
 add_executable(apply_template ${CMAKE_CURRENT_LIST_DIR}/demo/apply_template.cpp)
 target_link_libraries(apply_template ${LLM_DEPS})

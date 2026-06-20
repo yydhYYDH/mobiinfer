@@ -221,6 +221,15 @@ private:
     std::vector<bool> mChunkUseOm;               // per-chunk: true → OM, false → MNN Module
     std::set<int> mOmDeepstackDupIndices;        // chunk indices where OM output[0] → deepstack
     std::shared_ptr<Executor::RuntimeManager> mVisionBlocksRuntimeManager;
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+    // Opt-in: dump real per-chunk visual calibration inputs to disk.
+    // All three stay default/empty unless MNN_VISUAL_CHUNK_INPUT_DUMP is enabled
+    // AND the config provides visual_chunk_input_dump_dir, so behavior is unchanged
+    // when the feature is off or unconfigured.
+    std::string mVisualChunkDumpDir;
+    int mVisualChunkDumpMaxSamples = 0;
+    int mVisualChunkDumpedSamples = 0;
+#endif
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;
     int64_t mThinkerElapsedUs = 0;
