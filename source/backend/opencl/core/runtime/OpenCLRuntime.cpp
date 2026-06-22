@@ -147,8 +147,13 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                     isSetWorkGroupAttribute = true;
                 }
                 // 8Gen1 and after
-                if(adrenoVersion >= "730") {
+                int adrenoVersionNum = std::atoi(adrenoVersion.c_str());
+                if (adrenoVersionNum >= 600) {
                     mGpuLevel = TOP;
+                } else if (adrenoVersionNum >= 540) {
+                    mGpuLevel = MEDIUM;
+                } else if (adrenoVersionNum < 540) {
+                    mGpuLevel = LOW;
                 }
                 mDeviceInfo = deviceVersion.size() <= 14 ? deviceVersion : deviceVersion.substr(deviceVersion.size()-14);
             } else if (deviceName.find("Mali") != std::string::npos) {
@@ -398,6 +403,14 @@ std::vector<size_t> OpenCLRuntime::getMaxImage2DSize() {
 
 bool OpenCLRuntime::isSupportedFP16() const {
     return mIsSupportedFP16;
+}
+
+bool OpenCLRuntime::isClCreateImageAvailable() const {
+#ifdef MNN_USE_LIB_WRAPPER
+    return OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clCreateImage != nullptr;
+#else
+    return true; // clCreateImage is available when statically linked with OpenCL 1.2+
+#endif
 }
 
 bool OpenCLRuntime::isDeviceSupportedLowPower() const {
@@ -1062,6 +1075,7 @@ void OpenCLRuntime::printEventTime(){
         
         kernels[i] = std::make_pair(mEvents[i].first, kernel_time);
     }
+#ifndef MNN_GPU_PROFILE_SILENT
 #ifdef SORT_PROFILE_TIME
     for(int i = 0; i < mEvents.size(); i++) {
         for(int j = i+1; j < mEvents.size(); j++) {
@@ -1078,8 +1092,9 @@ void OpenCLRuntime::printEventTime(){
     for(int i = 0; i < mEvents.size(); i++) {
         MNN_PRINT("kernel time = %d    us %s\n", kernels[i].second, kernels[i].first.c_str());
     }
-    mEvents.clear();
     MNN_PRINT("total kernel time = %d  us, conv time = %d us (gemm2:%d us, gemm1:%d us, 1x1:%d us, ori:%d us, wino: %d us, other: %d us), while gemm time = %d us (core gemm time: %d us, softmax:%d us), ori softmax: %d us, raster[%d] time: %d us\n", mKernelTime, conv_time, conv_gemm2_buf_time, conv_gemm1_buf_time, conv_1x1_buf_time, conv_ori_buf_time, wino_gemm_time, conv_time-conv_gemm2_buf_time-conv_gemm1_buf_time-conv_1x1_buf_time-conv_ori_buf_time-wino_gemm_time, loop_bg_time, loop_bg_gemm_time, loop_softmax_time, ori_softmax_time, raster_num, raster_time);
+#endif // MNN_GPU_PROFILE_SILENT
+    mEvents.clear();
 #endif
 }
 } // namespace MNN

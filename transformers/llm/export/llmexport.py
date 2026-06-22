@@ -226,6 +226,24 @@ class LlmExporter(torch.nn.Module):
             MNNConverter(self, None).export(eagle_onnx)
             MNNConverter(self, None).export(eagle_fc_onnx)
 
+    def export_dflash(self):
+        if not hasattr(self.args, 'dflash_path') or self.args.dflash_path is None:
+            return
+        from utils.dflash import DFlash
+        self.dflash = DFlash(self.args.dflash_path, self.model)
+        # Set target layer ids on args so model.forward() can use them
+        self.args.dflash_target_layer_ids = self.dflash.target_layer_ids
+        dflash_onnx, dflash_fc_onnx = self.dflash.export(self.onnx_path)
+        if self.mnn_converter:
+            # Disable transformerFuse for dflash model: dflash uses non-causal (bidirectional) attention,
+            # but MNN's fused attention assumes causal masking which breaks dflash's attention pattern.
+            # Use 8-bit quantization for dflash model to balance quality and size.
+            MNNConverter(self, self.dflash.unloaded_ops).export(dflash_onnx, quant_bit=8, transformer_fuse=False)
+            # FC model must NOT be quantized: the input (concatenated hidden states from
+            # multiple target layers) has very large value ranges during prefill, which
+            # causes int8 quantization overflow and produces all-zero outputs.
+            MNNConverter(self, None).export(dflash_fc_onnx, quant_bit=0, transformer_fuse=False)
+
 
     @spinner_run(f'export embedding to ')
     def export_embed(self):
@@ -255,7 +273,14 @@ class LlmExporter(torch.nn.Module):
                 q_weight_size = (oc * ic * format_bit + 7) // 8
                 alpha_size = oc * block_num * (1 if symmetric else 2) * 4
                 file_size = q_weight_size + alpha_size
-                self.llm_config['tie_embeddings'] = [0, q_weight_size, alpha_size, format_bit, quant_block]
+                self.llm_config['tie_embeddings'] = {
+                    "weight_offset": 0,
+                    "alpha_offset": q_weight_size,
+                    "alpha_size": alpha_size,
+                    "quant_bit": format_bit,
+                    "quant_block": quant_block,
+                    "alpha_dtype": "fp32",
+                }
 
             with open(embedding_file, 'wb') as f:
                 if file_size > 0:
@@ -286,7 +311,14 @@ class LlmExporter(torch.nn.Module):
             with open(embedding_file, 'wb') as f:
                 weight_size = f.write(q_weight.numpy().tobytes())
                 alpha_size = f.write(alpha.numpy().tobytes())
-            self.llm_config['tie_embeddings'] = [0, weight_size, alpha_size, quant_bit, quant_block]
+            self.llm_config['tie_embeddings'] = {
+                "weight_offset": 0,
+                "alpha_offset": weight_size,
+                "alpha_size": alpha_size,
+                "quant_bit": quant_bit,
+                "quant_block": quant_block,
+                "alpha_dtype": "fp32",
+            }
         else:
             raise ValueError(f"Unsupported embedding bit precision: {format_bit}")
 
@@ -386,6 +418,14 @@ class LlmExporter(torch.nn.Module):
             if self.args.eagle_path is not None:
                 config['speculative_type'] = 'eagle'
                 config['hidden_states'] = True
+            if hasattr(self.args, 'dflash_path') and self.args.dflash_path is not None:
+                config['speculative_type'] = 'dflash'
+                config['hidden_states'] = True
+                config['dflash_model'] = 'dflash.mnn'
+                config['dflash_fc'] = 'dflash_fc.mnn'
+                config['dflash_block_size'] = self.dflash.block_size
+                config['dflash_mask_token_id'] = self.dflash.mask_token_id
+                config['dflash_target_layer_ids'] = self.dflash.target_layer_ids
             json.dump(config, f, ensure_ascii=False, indent=4)
         return config_json
 
@@ -1146,6 +1186,7 @@ class LlmExporter(torch.nn.Module):
         self.export_vision()
         self.export_audio()
         self.export_eagle()
+        self.export_dflash()
         self.export_language()
         self.export_mtp()
         self.export_tokenizer()
@@ -1197,7 +1238,11 @@ class EmbeddingExporter(LlmExporter):
         self.llm_config = {
             'model_type': self.config.model_type,
             'hidden_size' : self.config.hidden_size,
-            'attention_mask': 'int',
+            # qwen3 embedding is a causal decoder (last-token pooling) and needs a
+            # causal mask; bert/gte encoders are bidirectional and use the all-ones
+            # ('int') mask. Using 'int' for qwen3 makes attention bidirectional and
+            # degrades the embeddings (see issue: identical/low-quality vectors).
+            'attention_mask': 'float' if self.config.model_type == 'qwen3' else 'int',
             "jinja": {
                 "chat_template": self.build_prompt("{{ messages | map(attribute='content') | join('') }}")
             },
@@ -1293,6 +1338,7 @@ def build_args(parser):
                         )
     parser.add_argument('--tokenizer_path', type=str, default=None, help='tokenizer path, default is `None` mean using `--path` value.')
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
+    parser.add_argument('--dflash_path', type=str, default=None, help='dflash draft model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
     parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
@@ -1309,7 +1355,7 @@ def build_args(parser):
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
     parser.add_argument('--cleanup_onnx', action='store_true', help='Delete intermediate onnx files after export.')
-    parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
+    parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 2/3/4/8 (2 and 3 require ARMV86 i8mm + FP16), default is 4.')
     parser.add_argument('--quant_block', type=int, default=64, help='mnn quant block, 0 mean channel-wise, default is 64.')
     parser.add_argument('--visual_quant_bit', type=int, default=None, help='mnn visual quant bit, 4 or 8, default is setting in utils/vision.py by different vit model.')
     parser.add_argument('--visual_quant_block', type=int, default=None, help='mnn quant block, default is setting in utils/vision.py by different vit model.')
@@ -1324,6 +1370,7 @@ def build_args(parser):
     parser.add_argument('--group_conv_native', action='store_true', help='Whether or not to keep native group_conv.')
     parser.add_argument('--smooth', action='store_true', help='Whether or not to use smooth quant.')
     parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), default is False.')
+    parser.add_argument('--scale_bit', type=int, default=16, choices=[16, 32], help='Bit-width for quant scale/zero-point storage. Currently supports 16 (fp16, default) and 32 (fp32); 8/4 reserved for future.')
     parser.add_argument('--visual_sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint) for visual model, default is False.')
     parser.add_argument('--seperate_embed', action='store_true', help='For lm and embed shared model, whether or not to sepearte embed to avoid quant, default is False, if True, embed weight will be seperate to embedding bf16.bin.')
     parser.add_argument('--lora_split', action='store_true', help='Whether or not export lora split, default is False.')

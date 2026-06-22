@@ -116,7 +116,9 @@ class LlmModel(PreTrainedModel):
         # print(f"Loading model type: {model_type}\n{original_model}")
 
         # LoRA
-        if args.lora_path is not None and not args.lora_split:
+        if (args is not None
+                and hasattr(args, 'lora_path') and args.lora_path is not None
+                and (not hasattr(args, 'lora_split') or not args.lora_split)):
             from peft import PeftModel
             adapter = PeftModel.from_pretrained(original_model, model_id=args.lora_path)
             original_model = adapter.merge_and_unload(progressbar=True)
@@ -339,7 +341,14 @@ class LlmModel(PreTrainedModel):
         if self.scale_emb is not None:
             hidden_states = hidden_states * self.scale_emb
 
-        eagle_hidden_states = []
+        spec_hidden_states = []
+        eagle_layer_ids = set()
+        dflash_layer_ids = set()
+        if self.args and self.args.eagle_path:
+            eagle_layer_ids = {len(self.blocks)-3, len(self.blocks)//2, 2}
+        elif self.args and hasattr(self.args, 'dflash_target_layer_ids') and self.args.dflash_target_layer_ids:
+            dflash_layer_ids = set(self.args.dflash_target_layer_ids)
+
         rotary_pos_emb = self.rotary(position_ids)
         if self.args and self.args.test and rotary_pos_emb.dtype != hidden_states.dtype:
             rotary_pos_emb = rotary_pos_emb.type(hidden_states.dtype)
@@ -358,10 +367,9 @@ class LlmModel(PreTrainedModel):
             if hasattr(self.blocks[i].self_attn, 'is_kv_shared_layer'):
                 self.blocks[i].self_attn._shared_kv_cache = shared_kv_cache
 
-            # eagle3 hidden states
-            if self.args and self.args.eagle_path and (i == len(self.blocks)-3 or i == len(self.blocks)//2 or i==2):
-                eagle_hidden_states.append(hidden_states)
-
+            # eagle: collect hidden states BEFORE the layer (input to layer)
+            if i in eagle_layer_ids:
+                spec_hidden_states.append(hidden_states)
             # sliding or full attn mask
             if self.config.attention_type == 'mix':
                 is_sliding = i in self.config.sliding_attn_layers
@@ -387,6 +395,10 @@ class LlmModel(PreTrainedModel):
                     os.makedirs(self.args.dump_hidden_states)
                 np.savetxt(os.path.join(self.args.dump_hidden_states, 'hidden_states_{}.txt'.format(i)), hidden_states.float().cpu().detach().numpy().flatten())
 
+            # dflash: collect hidden states AFTER the layer (output of layer)
+            if i in dflash_layer_ids:
+                spec_hidden_states.append(hidden_states)
+
         talker_embeds = None
         if hasattr(self, 'talker') and self.talker is not None:
             talker_embeds = self.final_layernorm(hidden_states) + input_ids.permute([1, 0, 2])
@@ -409,8 +421,8 @@ class LlmModel(PreTrainedModel):
             hidden_states = hidden_states[:, logits_index_long:, :]
         logits = self.lm(hidden_states)
 
-        if self.args and self.args.eagle_path is not None:
-            final_layernorm = torch.cat(eagle_hidden_states, dim=-1)
+        if self.args and (self.args.eagle_path is not None or (hasattr(self.args, 'dflash_target_layer_ids') and self.args.dflash_target_layer_ids)):
+            final_layernorm = torch.cat(spec_hidden_states, dim=-1)
 
         return logits, final_layernorm, talker_embeds
 
@@ -516,6 +528,14 @@ class EmbeddingModel(LlmModel):
         model.blocks = transformer.layer
         # some wrapper
         model.num_hidden_layers = len(model.blocks)
+        # transformers>=5.x zeroes non-persistent buffers during from_pretrained,
+        # force-recompute RoPE inv_freq / cos_sin cache so the exported graph carries valid values.
+        rope = getattr(model.embed, 'rotary_emb', None)
+        if rope is not None and hasattr(rope, '_set_cos_sin_cache') and rope.inv_freq.abs().sum().item() == 0:
+            max_pos = rope.max_position_embeddings
+            if hasattr(rope, 'scaling_factor'):
+                max_pos = int(max_pos * rope.scaling_factor)
+            rope._set_cos_sin_cache(max_pos, rope.inv_freq.device, torch.float32)
         return model
 
     def forward(self, inputs_embeds, attention_mask, position_ids):

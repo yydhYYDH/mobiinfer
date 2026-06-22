@@ -55,6 +55,7 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_CUDA_QUANT       | 是否打开CUDA 量化文件编译，默认为`OFF` |
 | MNN_CUDA_BF16        | 是否打开CUDA Bf16文件编译，默认为`OFF` |
 | MNN_CUDA_TUNE_PARAM  | 是否打开CUDA TUNE相关文件编译，目前仅支持安培及以上架构，默认为`OFF` |
+| MNN_CUDA_NATIVE_ARCH | 是否仅编译本机检测到的CUDA架构(单显卡环境下加快构建)，默认为`OFF` |
 | MNN_TENSORRT         | 是否构建`TensorRT`后端，默认为`OFF` |
 | MNN_COREML           | 是否构建`CoreML`后端，默认为`OFF` |
 | MNN_NNAPI            | 是否构建`NNAPI`后端，默认为`OFF`  |
@@ -74,6 +75,7 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_AVX512_VNNI      | 是否使用`avx512_vnni`指令，该宏仅在`MNN_AVX512=ON`时生效，默认为`OFF` |
 | MNN_OPENCL_SIZE_CUT  | 是否为了降低OpenCL大小而关闭OpenCL Buffer实现，该宏仅在`MNN_OPENCL=ON`时生效，默认为`OFF` |
 | MNN_GPU_TIME_PROFILE | 是否打开OpenCL后端及Vulkan后端的Kernel性能Profile，该宏仅在`MNN_OPENCL=ON`或`MNN_VULKAN=ON`时生效，默认为`OFF` |
+| MNN_GPU_PROFILE_SILENT | 在GPU性能Profile开启时，仅累计总耗时而不打印每个Kernel的详细信息，可通过`Executor::getLastGpuTimeMs()`获取最近一次推理的GPU总耗时（毫秒），该宏仅在`MNN_GPU_TIME_PROFILE=ON`时生效，默认为`OFF` |
 | MNN_METALLIB_SOURCE  | 使用Metal时是否直接使用Metal源码，该宏仅在`MNN_METAL=ON`时生效，默认为`ON` |
 | MNN_VULKAN_DEBUG     | 是否打开Vulkan的DEBUG模式，该宏仅在`MNN_VULKAN=ON`时生效，默认为`OFF` |
 | MNN_OPENGL_REGEN     | 是否重新生成OpenGL Kenel，该宏仅在`MNN_OPENGL=ON`时生效，默认为`OFF` |
@@ -96,7 +98,6 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_AUDIO_TEST       | 构建MNN的Audio功能是否开启单元测试，默认为`OFF` |
 | MNN_VULKAN_IMAGE     | 构建MNN的Vulkan后端时采用Image内存模式，以便支持FP16和部分移动端上GPU的加速，默认为`ON` |
 | MNN_LOW_MEMORY       | 是否支持低内存模式，支持低内存模式使用权值量化模型并设置`low_memory`则会使用计算时反量化，默认为`OFF` |
-| MNN_CPU_WEIGHT_DEQUANT_GEMM       | 是否编译CPU权重反量化的矩阵乘Kernel， 如果打开该编译宏并且在CPU推理时设置MNN::BackendConfig::MemoryMode=Memory_Normal，就会使用权重反量化算子进行权重量化模型的推理，默认为`OFF` |
 | MNN_SUPPORT_RENDER   | 是否支持图形渲染相关算子实现，默认为 `OFF` |
 | MNN_SUPPORT_TRANSFORMER_FUSE | 是否支持Fuse Transformer相关OP实现，默认为 `OFF` |
 | MNN_BUILD_LLM        | 是否构建基于MNN的llm库和demo，默认为`OFF` ，打开时 MNN_LOW_MEMORY , MNN_SUPPORT_TRANSFORMER_FUSE 对应开启|

@@ -484,3 +484,11 @@ transformers/llm/export/logv5.txt
 transformers/llm/export/run_omc_convert_visual.sh
 transformers/llm/export/run_omc_convert_visualv3.sh
 transformers/llm/export/run_visual_blocks_pipeline.sh
+
+# test_ci.sh per-run artifacts
+/logs/
+/smoke_sources/
+/models/
+# smoke models converted on the host by ./test_ci.sh local (sources are fetched
+# into /smoke_sources/, then MNNConvert writes the .caffe.mnn here)
+/resource/model/**/*.caffe.mnn

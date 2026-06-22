@@ -25,6 +25,7 @@ class LlmConfig(PretrainedConfig):
         self.tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         self.conv_L_cache = kwargs.pop("conv_L_cache", 0)
         self.rope_parameters = kwargs.pop("rope_parameters", None)
+        self.qk_norm_after_rope = kwargs.pop("qk_norm_after_rope", False)
         self.model_map = kwargs.pop("model_map", {})
         super().__init__(**kwargs)
 
@@ -80,6 +81,16 @@ class LlmConfig(PretrainedConfig):
         if llm_config.num_key_value_heads is None:
             llm_config.num_key_value_heads = llm_config.num_attention_heads
 
+        # Compatibility: transformers>=5.x moved rope_theta into rope_parameters dict
+        if llm_config.rope_theta is None or llm_config.rope_theta == 10000.0:
+            # Try rope_parameters (transformers 5.x style)
+            rp = getattr(config, 'rope_parameters', None) or getattr(config, 'rope_scaling', None)
+            if isinstance(rp, dict) and 'rope_theta' in rp:
+                llm_config.rope_theta = rp['rope_theta']
+            # Fallback to raw config JSON
+            elif 'rope_theta' in raw_config:
+                llm_config.rope_theta = raw_config['rope_theta']
+
         if llm_config.rope_theta is None:
             llm_config.rope_theta = 10000.0
 
@@ -93,12 +104,13 @@ class LlmConfig(PretrainedConfig):
                 llm_config.head_dim = llm_config.hidden_size // llm_config.num_attention_heads
 
         # Determine attention type.
-        # Qwen3.5 mixed-attention models mark non-full layers as
-        # `linear_attention`; reuse the existing mix path for them.
+        # Only `sliding_attention` layers need a sliding-window mask and
+        # therefore the "mix" path.  `linear_attention` layers (e.g. Qwen3.5)
+        # do not use the attention mask at all, so they are treated as full.
         sliding_attn_layers = []
         if hasattr(llm_config, 'layer_types') and llm_config.layer_types:
             for i in range(len(llm_config.layer_types)):
-                if llm_config.layer_types[i] in ('sliding_attention', 'linear_attention'):
+                if llm_config.layer_types[i] == 'sliding_attention':
                     sliding_attn_layers.append(i)
 
         if llm_config.num_hidden_layers and len(sliding_attn_layers) >= llm_config.num_hidden_layers:
@@ -108,7 +120,6 @@ class LlmConfig(PretrainedConfig):
             llm_config.sliding_attn_layers = sliding_attn_layers
         else:
             llm_config.attention_type = 'full'
-
         return llm_config
 
 # export config
@@ -141,7 +152,7 @@ class LLMExportConfig:
     attention_mask: str = 'float'
     attention_type: str = 'full'
     sliding_window: int = 0
-    tie_embeddings: Optional[List[Union[int]]] = field(default_factory=list)
+    tie_embeddings: Optional[Union[List[int], Dict[str, Any]]] = field(default_factory=list)
     jinja: Dict[str, Any] = field(default_factory=dict)
     vision: Optional[VisionExportConfig] = None
 
