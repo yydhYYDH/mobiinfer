@@ -7,6 +7,7 @@
 #include <sstream>
 #include <regex>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <initializer_list>
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
@@ -1196,14 +1197,11 @@ int main(int argc, char ** argv) {
             auto profiler = MNN::Profiler::getInstance();
             llm->setDebugCallback(
                 [profiler](const std::vector<MNN::Tensor*>& inputs, const MNN::OperatorInfo* info) {
-                    profiler->start(info);
+                    profiler->start(inputs, info);
                     return true;
                 },
                 [profiler](const std::vector<MNN::Tensor*>& outputs, const MNN::OperatorInfo* info) {
-                    for (auto o : outputs) {
-                        o->wait(MNN::Tensor::MAP_TENSOR_READ, true);
-                    }
-                    profiler->end(info);
+                    profiler->end(outputs, info);
                     return true;
                 }
             );
@@ -1290,8 +1288,10 @@ int main(int argc, char ** argv) {
     if (enableProfile) {
         auto profiler = MNN::Profiler::getInstance();
         fprintf(stdout, "\n========== Operator Profile Results ==========\n");
-        // profiler->printTimeByName(1);
+        profiler->printTimeByName(1);
         profiler->printTimeByType(1);
+        mkdir("../logs", 0755);
+        profiler->dumpCSV("../logs/llm_bench_op_profile_phase.csv", 1);
     }
 
     fprintf(stdout, "\n");

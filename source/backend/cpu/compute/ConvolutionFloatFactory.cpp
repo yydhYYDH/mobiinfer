@@ -21,6 +21,7 @@
 #endif
 #include "core/Macro.h"
 #include "core/OpCommonUtils.hpp"
+#include "core/ProfileExecutionInfo.hpp"
 #include "backend/cpu/OneDNNConvolution.hpp"
 #include "backend/cpu/compute/ConvInt8TiledExecutor.hpp"
 
@@ -31,6 +32,18 @@
 #endif //MNN_KLEIDIAI_ENABLED
 
 namespace MNN {
+
+static std::string _opName(const Op* op) {
+    if (op == nullptr || op->name() == nullptr) {
+        return "";
+    }
+    return op->name()->str();
+}
+
+static Execution* _profiledExecution(const Op* op, Execution* execution, const std::string& info) {
+    setProfileExecutionInfo(_opName(op), info);
+    return execution;
+}
 
 #ifdef MNN_KLEIDIAI_ENABLED
 static Execution* _createKleidiAIUnit(const Tensor* input, const Tensor* output, Backend* backend, const Op* op,
@@ -124,14 +137,17 @@ static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend
     auto conv2d = op->main_as_Convolution2D();
     auto common = conv2d->common();
 #ifdef MNN_USE_ONEDNN
-    return OneDNN::createConvolution(common, backend, originWeight, originWeightSize, bias, biasSize);
+    return _profiledExecution(op, OneDNN::createConvolution(common, backend, originWeight, originWeightSize, bias, biasSize),
+                              "CPU OneDNNConvolution");
 #endif
 
 #ifdef MNN_USE_SPARSE_COMPUTE
     if (conv2d->sparseParameter() && nullptr != weightQuantInfo.get()) {
         if (supportSparse && weightQuantInfo->quan->index() != nullptr) {
-            return new SparseConvolutionTiledExecutor(common, backend, weightQuantInfo->quan,
-                                                      conv2d->sparseParameter(), bias, biasSize);
+            return _profiledExecution(op,
+                                      new SparseConvolutionTiledExecutor(common, backend, weightQuantInfo->quan,
+                                                                         conv2d->sparseParameter(), bias, biasSize),
+                                      "CPU SparseConvolutionTiledExecutor");
         }
     }
 #endif
@@ -153,33 +169,52 @@ static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend
 #ifdef MNN_LOW_MEMORY
     if (lowMemory && nullptr != weightQuantInfo.get() && originWeightSize == 0) {
         if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
-            return new DenseConvInt8TiledExecutor(backend, op, weightQuantInfo, true);
+            return _profiledExecution(op, new DenseConvInt8TiledExecutor(backend, op, weightQuantInfo, true),
+                                      "CPU DenseConvInt8TiledExecutor dynamic");
         } else {
-            return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, weightQuantInfo);
+            return _profiledExecution(op,
+                                      new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize,
+                                                                        bias, biasSize, weightQuantInfo),
+                                      "CPU DenseConvolutionTiledExecutor dequant");
         }
     }
 #else
     if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
-        return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, weightQuantInfo);
+        return _profiledExecution(op,
+                                  new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize,
+                                                                    bias, biasSize, weightQuantInfo),
+                                  "CPU DenseConvolutionTiledExecutor low-memory");
     }
 #endif
 
 #ifndef MNN_REDUCE_SIZE
     if (fastWay && cpuBackend->functions()->matmulBytes == 0) {
-        return new Convolution1x1Strassen(common, backend, originWeight, originWeightSize, bias, biasSize);
+        return _profiledExecution(op,
+                                  new Convolution1x1Strassen(common, backend, originWeight, originWeightSize, bias,
+                                                             biasSize),
+                                  "CPU Convolution1x1Strassen");
     }
 #endif
 
     if (cpuBackend->getRuntime()->hint().winogradMemoryUsed == 0 || (!ConvolutionWinogradBridge::canUseWinograd(common))) {
-        return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, nullptr);
+        return _profiledExecution(op,
+                                  new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize,
+                                                                    bias, biasSize, nullptr),
+                                  "CPU DenseConvolutionTiledExecutor");
     }
     PerfConfig convPerfconfig = DenseConvolutionTiledExecutor::bestTileConvolutionConfig(common, input, output, cpuBackend->threadNumber(), backend);
     auto winogradConfig = ConvolutionWinogradBridge::bestWinogradUnit(common, input, output, cpuBackend->threadNumber(), backend, convPerfconfig);
     if (winogradConfig.unit <= 1) {
-        return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, nullptr);
+        return _profiledExecution(op,
+                                  new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize,
+                                                                    bias, biasSize, nullptr),
+                                  "CPU DenseConvolutionTiledExecutor");
     }
-    return ConvolutionWinogradBridge::createWinogradImpl(common, input, output, backend, originWeight, originWeightSize, bias, biasSize,
-                                   winogradConfig);
+    return _profiledExecution(op,
+                              ConvolutionWinogradBridge::createWinogradImpl(common, input, output, backend,
+                                                                            originWeight, originWeightSize, bias,
+                                                                            biasSize, winogradConfig),
+                              "CPU ConvolutionWinograd");
 }
 
 Execution* ConvolutionFloatFactory::create(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,

@@ -31,11 +31,13 @@ public:
     * @param op        given op.
     */
     void start(const OperatorInfo* info);
+    void start(const std::vector<Tensor*>& inputs, const OperatorInfo* info);
     /**
      * @brief end profiler with op name and type.
      * @param name      op name.
      */
     void end(const OperatorInfo* info);
+    void end(const std::vector<Tensor*>& outputs, const OperatorInfo* info);
     /**
      * print profiler time result, grouped by type and sorter by time cost.
      * @param loops     loop count.
@@ -46,6 +48,8 @@ public:
      * @param loops     loop count.
      */
     void printTimeByName(int loops = 1);
+
+    void dumpCSV(const std::string& file, int loops = 1);
 
     /**
      * print op that flops / time is slow
@@ -58,10 +62,16 @@ private:
     struct Record {
         std::string name;
         std::string type;
+        std::string phase;
+        std::string execution;
         int64_t order;
         int64_t calledTimes;
         float costTime;
+        float dispatchTime;
+        float waitTime;
         float flops;
+        uint64_t inputBytes;
+        uint64_t outputBytes;
     };
 
     static Profiler* gInstance;
@@ -71,10 +81,13 @@ private:
     float mTotalMFlops  = 0.0f;
     std::map<std::string, Record> mMapByType;
     std::map<std::string, Record> mMapByName;
+    std::map<std::string, Record> mMapByNamePhase;
+    std::string mActiveNamePhaseKey;
 
 private:
     Record& getTypedRecord(const OperatorInfo* info);
     Record& getNamedRecord(const OperatorInfo* info);
+    Record& getNamePhaseRecord(const OperatorInfo* info);
 };
 
 } // namespace MNN

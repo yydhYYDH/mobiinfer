@@ -14,7 +14,9 @@
 #include <fstream>
 #include <sstream>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <initializer_list>
+#include "../../../../tools/cpp/Profiler.hpp"
 //#define LLM_SUPPORT_AUDIO
 #ifdef LLM_SUPPORT_AUDIO
 #include "audio/audio.hpp"
@@ -335,6 +337,21 @@ int main(int argc, const char* argv[]) {
     std::cout << "config path is " << config_path << std::endl;
     std::unique_ptr<Llm> llm(Llm::createLLM(config_path));
     llm->set_config("{\"tmp_path\":\"tmp\"}");
+    MNN::Profiler* image_profiler = nullptr;
+    if (argc >= 4 && std::string(argv[2]) == "--image") {
+        llm->set_config(R"({"enable_debug":true})");
+        image_profiler = MNN::Profiler::getInstance();
+        llm->setDebugCallback(
+            [image_profiler](const std::vector<MNN::Tensor*>& inputs, const MNN::OperatorInfo* info) {
+                image_profiler->start(inputs, info);
+                return true;
+            },
+            [image_profiler](const std::vector<MNN::Tensor*>& outputs, const MNN::OperatorInfo* info) {
+                image_profiler->end(outputs, info);
+                return true;
+            }
+        );
+    }
     {
         AUTOTIME;
         bool res = llm->load();
@@ -358,6 +375,43 @@ int main(int argc, const char* argv[]) {
         // 设置为同步模式（避免异步问题）
         llm->set_config(R"({"async":false})");
         return start_http_server(llm.get(), port);
+    }
+
+    if (argc >= 4 && std::string(argv[2]) == "--image") {
+        std::string image_path = argv[3];
+        std::string question = argc >= 5 ? argv[4] : "Describe this image.";
+        int max_token_number = -1;
+        if (argc >= 6) {
+            std::istringstream os(argv[5]);
+            os >> max_token_number;
+        }
+        MultimodalPrompt prompt;
+        prompt.prompt_template = "<img>" + image_path + "</img>" + question;
+        std::ostringstream answer;
+        llm->set_config(R"({"async":false})");
+        llm->response(prompt, &answer, nullptr, max_token_number);
+        MNN_PRINT("%s", answer.str().c_str());
+        auto context = llm->getContext();
+        float vision_s = context->vision_us / 1e6;
+        float prefill_s = context->prefill_us / 1e6;
+        float decode_s = context->decode_us / 1e6;
+        MNN_PRINT("\n#################################\n");
+        MNN_PRINT("prompt tokens num = %d\n", context->prompt_len);
+        MNN_PRINT("decode tokens num = %d\n", context->gen_seq_len);
+        MNN_PRINT(" vision time = %.2f s\n", vision_s);
+        MNN_PRINT(" pixels_mp = %.2f MP\n", context->pixels_mp);
+        MNN_PRINT("prefill time = %.2f s\n", prefill_s);
+        MNN_PRINT(" decode time = %.2f s\n", decode_s);
+        MNN_PRINT("prefill speed = %.2f tok/s\n", context->prompt_len / prefill_s);
+        MNN_PRINT(" decode speed = %.2f tok/s\n", context->gen_seq_len / decode_s);
+        MNN_PRINT(" vision speed = %.3f MP/s\n", context->pixels_mp / vision_s);
+        MNN_PRINT("##################################\n");
+        MNN_PRINT("\n========== Operator Profile Results ==========\n");
+        image_profiler->printTimeByName(1);
+        image_profiler->printTimeByType(1);
+        mkdir("../logs", 0755);
+        image_profiler->dumpCSV("../logs/qwen3_vl_img_op_profile_phase.csv", 1);
+        return 0;
     }
 
 

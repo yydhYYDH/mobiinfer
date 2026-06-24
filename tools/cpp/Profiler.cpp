@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <algorithm>
+#include <fstream>
 #include <string>
 #if defined(_MSC_VER)
 #include <Windows.h>
@@ -18,6 +19,7 @@
 #endif
 #include "Profiler.hpp"
 #include "core/Macro.h"
+#include "core/ProfileExecutionInfo.hpp"
 
 #define MFLOPS (1e6)
 
@@ -55,6 +57,46 @@ static std::string toString(const std::vector<int>& shape) {
     return std::string(current);
 }
 
+static uint64_t tensorBytes(const std::vector<Tensor*>& tensors) {
+    uint64_t bytes = 0;
+    for (auto tensor : tensors) {
+        if (tensor == nullptr) {
+            continue;
+        }
+        bytes += tensor->usize();
+    }
+    return bytes;
+}
+
+static std::string readField(const std::string& content, const std::string& key, const std::string& fallback = "") {
+    auto pos = content.find(key);
+    if (pos == std::string::npos) {
+        return fallback;
+    }
+    pos += key.size();
+    auto end = content.find(' ', pos);
+    if (end == std::string::npos) {
+        return content.substr(pos);
+    }
+    return content.substr(pos, end - pos);
+}
+
+static std::string csvEscape(const std::string& value) {
+    if (value.find_first_of(",\"\n") == std::string::npos) {
+        return value;
+    }
+    std::string result = "\"";
+    for (auto c : value) {
+        if (c == '"') {
+            result += "\"\"";
+        } else {
+            result += c;
+        }
+    }
+    result += "\"";
+    return result;
+}
+
 Profiler* Profiler::gInstance = nullptr;
 Profiler* Profiler::getInstance() {
     if (gInstance == nullptr) {
@@ -74,9 +116,13 @@ Profiler::Record& Profiler::getTypedRecord(const OperatorInfo* op) {
     mMapByType.insert(std::make_pair(typeStr, Record()));
     Record& record     = mMapByType.find(typeStr)->second;
     record.costTime    = 0.0f;
+    record.dispatchTime = 0.0f;
+    record.waitTime    = 0.0f;
     record.calledTimes = 0;
     record.type        = op->type();
     record.flops       = 0.0f;
+    record.inputBytes  = 0;
+    record.outputBytes = 0;
 
     return record;
 }
@@ -95,25 +141,92 @@ Profiler::Record& Profiler::getNamedRecord(const OperatorInfo* op) {
     record.name        = op->name();
     record.type        = op->type();
     record.flops       = 0.0f;
+    record.dispatchTime = 0.0f;
+    record.waitTime    = 0.0f;
+    record.inputBytes  = 0;
+    record.outputBytes = 0;
 
     return record;
 }
 
+Profiler::Record& Profiler::getNamePhaseRecord(const OperatorInfo* op) {
+    auto execution = getCurrentProfileExecutionInfo(op->name());
+    auto phase = readField(execution, "phase=", "unknown");
+    auto key = op->name() + "\t" + phase + "\t" + execution;
+    auto iter = mMapByNamePhase.find(key);
+    if (iter != mMapByNamePhase.end()) {
+        return iter->second;
+    }
+
+    mMapByNamePhase.insert(std::make_pair(key, Record()));
+    Record& record     = mMapByNamePhase.find(key)->second;
+    record.costTime    = 0.0f;
+    record.name        = op->name();
+    record.type        = op->type();
+    record.phase       = phase;
+    record.execution   = execution;
+    record.flops       = 0.0f;
+    record.dispatchTime = 0.0f;
+    record.waitTime    = 0.0f;
+    record.inputBytes  = 0;
+    record.outputBytes = 0;
+    return record;
+}
+
 void Profiler::start(const OperatorInfo* info) {
+    start(std::vector<Tensor*>(), info);
+}
+
+void Profiler::start(const std::vector<Tensor*>& inputs, const OperatorInfo* info) {
     mStartTime = getTime();
     mTotalMFlops += info->flops();
     auto& typed = getTypedRecord(info);
     typed.calledTimes++;
     typed.flops += info->flops();
+    typed.inputBytes += tensorBytes(inputs);
     auto& named = getNamedRecord(info);
     named.flops += info->flops();
+    named.inputBytes += tensorBytes(inputs);
+    auto& namedPhase = getNamePhaseRecord(info);
+    namedPhase.calledTimes++;
+    namedPhase.flops += info->flops();
+    namedPhase.inputBytes += tensorBytes(inputs);
+    mActiveNamePhaseKey = info->name() + "\t" + namedPhase.phase + "\t" + namedPhase.execution;
 }
 
 void Profiler::end(const OperatorInfo* info) {
     mEndTime   = getTime();
     float cost = (float)(mEndTime - mStartTime) / 1000.0f;
     mMapByType[info->type()].costTime += cost;
+    mMapByType[info->type()].dispatchTime += cost;
     mMapByName[info->name()].costTime += cost;
+    mMapByName[info->name()].dispatchTime += cost;
+    mMapByNamePhase[mActiveNamePhaseKey].costTime += cost;
+    mMapByNamePhase[mActiveNamePhaseKey].dispatchTime += cost;
+    mTotalTime += cost;
+}
+
+void Profiler::end(const std::vector<Tensor*>& outputs, const OperatorInfo* info) {
+    auto dispatchEnd = getTime();
+    for (auto o : outputs) {
+        o->wait(MNN::Tensor::MAP_TENSOR_READ, true);
+    }
+    auto waitEnd = getTime();
+    float dispatchCost = (float)(dispatchEnd - mStartTime) / 1000.0f;
+    float waitCost = (float)(waitEnd - dispatchEnd) / 1000.0f;
+    float cost = dispatchCost + waitCost;
+    mMapByType[info->type()].costTime += cost;
+    mMapByType[info->type()].dispatchTime += dispatchCost;
+    mMapByType[info->type()].waitTime += waitCost;
+    mMapByType[info->type()].outputBytes += tensorBytes(outputs);
+    mMapByName[info->name()].costTime += cost;
+    mMapByName[info->name()].dispatchTime += dispatchCost;
+    mMapByName[info->name()].waitTime += waitCost;
+    mMapByName[info->name()].outputBytes += tensorBytes(outputs);
+    mMapByNamePhase[mActiveNamePhaseKey].costTime += cost;
+    mMapByNamePhase[mActiveNamePhaseKey].dispatchTime += dispatchCost;
+    mMapByNamePhase[mActiveNamePhaseKey].waitTime += waitCost;
+    mMapByNamePhase[mActiveNamePhaseKey].outputBytes += tensorBytes(outputs);
     mTotalTime += cost;
 }
 
@@ -159,16 +272,23 @@ void Profiler::printTimeByType(int loops) {
     std::sort(sorted.begin(), sorted.end());
     
     // fill in columns
-    const std::vector<std::string> header = {"Node Type", "Avg(ms)", "%", "Called times", "Flops Rate"};
+    const std::vector<std::string> header = {"Node Type",   "Avg(ms)",   "Dispatch(ms)", "Wait(ms)",
+                                             "%",           "Called times", "Flops Rate", "Act BW(GB/s)",
+                                             "GFLOPS"};
     std::vector<std::vector<std::string>> rows;
     for (auto iter : sorted) {
         auto record = mMapByType.find(iter.second)->second;
         std::vector<std::string> columns;
         columns.push_back(iter.second);
         columns.push_back(toString(record.costTime / (float)loops));
+        columns.push_back(toString(record.dispatchTime / (float)loops));
+        columns.push_back(toString(record.waitTime / (float)loops));
         columns.push_back(toString((record.costTime / (float)mTotalTime) * 100));
         columns.push_back(toString(record.calledTimes / loops));
         columns.push_back(toString((record.flops / (float)mTotalMFlops) * 100));
+        auto activationBytes = record.inputBytes + record.outputBytes;
+        columns.push_back(toString(record.costTime > 0.0f ? (float)activationBytes / record.costTime / 1000000.0f : 0.0f));
+        columns.push_back(toString(record.costTime > 0.0f ? record.flops / record.costTime : 0.0f));
         rows.emplace_back(columns);
     }
     printTable("Sort by time cost !", header, rows);
@@ -177,7 +297,9 @@ void Profiler::printTimeByType(int loops) {
 }
 
 void Profiler::printTimeByName(int loops) {
-    const std::vector<std::string> header = {"Node Name", "Op Type", "Avg(ms)", "%", "Flops Rate"};
+    const std::vector<std::string> header = {"Node Name", "Op Type", "Avg(ms)", "Dispatch(ms)", "Wait(ms)",
+                                             "%", "Flops Rate", "IO Bytes", "Static Bytes", "Act BW(GB/s)",
+                                             "Total BW(GB/s)", "GFLOPS", "Execution"};
     std::vector<std::vector<std::string>> rows;
     // sort by name
     for (auto iter: mMapByName) {
@@ -186,11 +308,95 @@ void Profiler::printTimeByName(int loops) {
         columns.push_back(iter.first);
         columns.push_back(record.type);
         columns.push_back(toString(record.costTime / (float)loops));
+        columns.push_back(toString(record.dispatchTime / (float)loops));
+        columns.push_back(toString(record.waitTime / (float)loops));
         columns.push_back(toString((record.costTime / (float)mTotalTime) * 100));
         columns.push_back(toString((record.flops / (float)mTotalMFlops) * 100));
+        auto activationBytes = record.inputBytes + record.outputBytes;
+        auto staticBytes = getProfileExecutionBytes(iter.first) * (uint64_t)record.calledTimes;
+        auto totalBytes = activationBytes + staticBytes;
+        columns.push_back(std::to_string(activationBytes / (uint64_t)loops));
+        columns.push_back(std::to_string(staticBytes / (uint64_t)loops));
+        columns.push_back(toString(record.costTime > 0.0f ? (float)activationBytes / record.costTime / 1000000.0f : 0.0f));
+        columns.push_back(toString(record.costTime > 0.0f ? (float)totalBytes / record.costTime / 1000000.0f : 0.0f));
+        columns.push_back(toString(record.costTime > 0.0f ? record.flops / record.costTime : 0.0f));
+        columns.push_back(getProfileExecutionInfo(iter.first));
         rows.emplace_back(columns);
     }
     printTable("Sort by node name !", header, rows);
+
+    std::vector<std::vector<std::string>> phaseRows;
+    for (auto iter : mMapByNamePhase) {
+        auto record = iter.second;
+        std::vector<std::string> columns;
+        auto activationBytes = record.inputBytes + record.outputBytes;
+        auto staticBytes = getProfileExecutionBytes(record.name) * (uint64_t)record.calledTimes;
+        auto totalBytes = activationBytes + staticBytes;
+        columns.push_back(record.name);
+        columns.push_back(record.type);
+        columns.push_back(record.phase);
+        columns.push_back(toString(record.costTime / (float)loops));
+        columns.push_back(toString(record.dispatchTime / (float)loops));
+        columns.push_back(toString(record.waitTime / (float)loops));
+        columns.push_back(toString((record.costTime / (float)mTotalTime) * 100));
+        columns.push_back(std::to_string(record.calledTimes / loops));
+        columns.push_back(std::to_string(activationBytes / (uint64_t)loops));
+        columns.push_back(std::to_string(staticBytes / (uint64_t)loops));
+        columns.push_back(toString(record.costTime > 0.0f ? (float)activationBytes / record.costTime / 1000000.0f : 0.0f));
+        columns.push_back(toString(record.costTime > 0.0f ? (float)totalBytes / record.costTime / 1000000.0f : 0.0f));
+        columns.push_back(toString(record.costTime > 0.0f ? record.flops / record.costTime : 0.0f));
+        columns.push_back(record.execution);
+        phaseRows.emplace_back(columns);
+    }
+    const std::vector<std::string> phaseHeader = {"Node Name", "Op Type", "Phase", "Avg(ms)", "Dispatch(ms)",
+                                                  "Wait(ms)", "%", "Called times", "IO Bytes", "Static Bytes",
+                                                  "Act BW(GB/s)", "Total BW(GB/s)", "GFLOPS", "Execution"};
+    printTable("Sort by node name and phase !", phaseHeader, phaseRows);
+}
+
+void Profiler::dumpCSV(const std::string& file, int loops) {
+    std::ofstream ofs(file.c_str());
+    if (!ofs.good()) {
+        MNN_ERROR("Can't open profile csv: %s\n", file.c_str());
+        return;
+    }
+    ofs << "node_name,op_type,phase,avg_ms,dispatch_ms,wait_ms,percent,called_times,flops_rate,"
+           "io_bytes,static_bytes,act_bw_gbps,total_bw_gbps,gflops,gemm_m,gemm_k,gemm_n,batch,ic,oc,"
+           "weight_bits,block_num,kernel,repack_via_int8,online_repack_for_prefill,execution\n";
+    for (auto iter : mMapByNamePhase) {
+        auto record = iter.second;
+        auto activationBytes = record.inputBytes + record.outputBytes;
+        auto staticBytes = getProfileExecutionBytes(record.name) * (uint64_t)record.calledTimes;
+        auto totalBytes = activationBytes + staticBytes;
+        auto execution = record.execution;
+        ofs << csvEscape(record.name) << ","
+            << csvEscape(record.type) << ","
+            << csvEscape(record.phase) << ","
+            << (record.costTime / (float)loops) << ","
+            << (record.dispatchTime / (float)loops) << ","
+            << (record.waitTime / (float)loops) << ","
+            << ((record.costTime / (float)mTotalTime) * 100) << ","
+            << (record.calledTimes / loops) << ","
+            << ((record.flops / (float)mTotalMFlops) * 100) << ","
+            << (activationBytes / (uint64_t)loops) << ","
+            << (staticBytes / (uint64_t)loops) << ","
+            << (record.costTime > 0.0f ? (float)activationBytes / record.costTime / 1000000.0f : 0.0f) << ","
+            << (record.costTime > 0.0f ? (float)totalBytes / record.costTime / 1000000.0f : 0.0f) << ","
+            << (record.costTime > 0.0f ? record.flops / record.costTime : 0.0f) << ","
+            << csvEscape(readField(execution, "gemmM=")) << ","
+            << csvEscape(readField(execution, "gemmK=")) << ","
+            << csvEscape(readField(execution, "gemmN=")) << ","
+            << csvEscape(readField(execution, "batch=")) << ","
+            << csvEscape(readField(execution, "ic=")) << ","
+            << csvEscape(readField(execution, "oc=")) << ","
+            << csvEscape(readField(execution, "weightBits=")) << ","
+            << csvEscape(readField(execution, "blockNum=")) << ","
+            << csvEscape(readField(execution, "gemmKernel=")) << ","
+            << csvEscape(readField(execution, "repackViaInt8=")) << ","
+            << csvEscape(readField(execution, "onlineRepackForPrefill=")) << ","
+            << csvEscape(execution) << "\n";
+    }
+    MNN_PRINT("Profile csv saved: %s\n", file.c_str());
 }
 void Profiler::printSlowOp(const std::string& type, int topK, float rate) {
     MNN_PRINT("Print <=%d slowest Op for %s, larger than %.2f\n", topK, type.c_str(), rate * 100.0f);

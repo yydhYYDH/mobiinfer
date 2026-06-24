@@ -85,7 +85,7 @@ ENDIF()
 
 
 if(MNN_LLM_BUILD_DEMO)
-    add_executable(llm_demo ${CMAKE_CURRENT_LIST_DIR}/demo/llm_demo.cpp)
+    add_executable(llm_demo ${CMAKE_CURRENT_LIST_DIR}/demo/llm_demo.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tools/cpp/Profiler.cpp)
     add_executable(embedding_demo ${CMAKE_CURRENT_LIST_DIR}/demo/embedding_demo.cpp)
     add_executable(reranker_demo ${CMAKE_CURRENT_LIST_DIR}/demo/reranker_demo.cpp)
     add_executable(rollback_demo ${CMAKE_CURRENT_LIST_DIR}/demo/rollback_demo.cpp)

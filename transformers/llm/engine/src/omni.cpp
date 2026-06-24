@@ -297,6 +297,9 @@ bool Omni::load() {
         config.backendConfig = &cpuBackendConfig;
         mProcessorRuntimeManager.reset(Executor::RuntimeManager::createRuntimeManager(config));
         setRuntimeHint(mProcessorRuntimeManager, true, true);
+        if (mConfig->config_.value("enable_debug", false)) {
+            mProcessorRuntimeManager->setMode(MNN::Interpreter::Session_Debug);
+        }
     }
     if (mConfig->has_talker()) {
         mTalker.reset(new Talker(mConfig, this));
@@ -344,6 +347,9 @@ bool Omni::load() {
             // hints. Keep default behavior (true) unless explicitly disabled.
             bool visualBlocksKvHints = mConfig->config_.value("visual_blocks_kv_hints", true);
             setRuntimeHint(mVisionBlocksRuntimeManager, false, visualBlocksKvHints);
+            if (mConfig->config_.value("enable_debug", false)) {
+                mVisionBlocksRuntimeManager->setMode(MNN::Interpreter::Session_Debug);
+            }
 
             Module::Config npuModuleCfg;
             if (npuCfg.type == MNN_FORWARD_USER_0 ||

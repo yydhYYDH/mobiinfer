@@ -9,9 +9,11 @@
 #include "ConvolutionTiledExecutor.hpp"
 #include "core/Macro.h"
 #include "core/BufferAllocator.hpp"
+#include "core/ProfileExecutionInfo.hpp"
 #include "SharedGather.hpp"
 
 #include <math.h>
+#include <sstream>
 #include "backend/cpu/CPUBackend.hpp"
 #include "core/Concurrency.h"
 #include "core/TensorUtils.hpp"
@@ -19,6 +21,57 @@
 #define QUANT_INFO_BYTES 4
 #define WEIGHT_ONLINE_REORDER 8
 namespace MNN {
+
+static std::string _opNameForProfile(const Op* op) {
+    if (op == nullptr || op->name() == nullptr) {
+        return "";
+    }
+    return op->name()->str();
+}
+
+static std::string _int8KernelName(decltype(CoreInt8Functions::Int8GemmKernel) kernel,
+                                   const MatmulRelatedFunctions& functions) {
+    if (kernel != nullptr && kernel == functions.Int8GemmKernel) {
+        return "Int8GemmKernel";
+    }
+    if (kernel != nullptr && kernel == functions.Int8GemmKernelFast) {
+        return "Int8GemmKernelFast";
+    }
+    if (kernel != nullptr && kernel == functions.Int8GemmKernel_W4) {
+        return "Int8GemmKernel_W4";
+    }
+    if (kernel != nullptr && kernel == functions.Int8GemmKernel_W2) {
+        return "Int8GemmKernel_W2";
+    }
+    if (kernel != nullptr && kernel == functions.Int8GemmKernel_W3) {
+        return "Int8GemmKernel_W3";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_Unit_FP32_DecodeMax) {
+        return "MNNGemmInt8AddBiasScale_Unit_FP32_DecodeMax";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_w4_Unit_FP32_DecodeMax) {
+        return "MNNGemmInt8AddBiasScale_w4_Unit_FP32_DecodeMax";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_Unit_FP16) {
+        return "MNNGemmInt8AddBiasScale_Unit_FP16";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_Unit_FP16_DecodeMax) {
+        return "MNNGemmInt8AddBiasScale_Unit_FP16_DecodeMax";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_w4_Unit_FP16) {
+        return "MNNGemmInt8AddBiasScale_w4_Unit_FP16";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_w4_Unit_FP16_DecodeMax) {
+        return "MNNGemmInt8AddBiasScale_w4_Unit_FP16_DecodeMax";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_w2_Unit_FP16) {
+        return "MNNGemmInt8AddBiasScale_w2_Unit_FP16";
+    }
+    if (kernel != nullptr && kernel == functions.MNNGemmInt8AddBiasScale_w3_Unit_FP16) {
+        return "MNNGemmInt8AddBiasScale_w3_Unit_FP16";
+    }
+    return "unknown";
+}
 
 ConvInt8TiledExecutor::ConvInt8TiledExecutor(Backend* backend, const Op* op)
     : CPUConvolution(op->main_as_Convolution2D()->common(), backend) {}
@@ -351,6 +404,7 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
                                                        std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon,
                                                        bool isDynamicQuant)
     : ConvInt8TiledExecutor(backend, op) {
+    mOpName = _opNameForProfile(op);
     // convolution info
     auto convOp = op->main_as_Convolution2D();
     int kernelCount = mCommon->kernelX() * mCommon->kernelY();
@@ -363,6 +417,10 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
 
     int blockNum = 1;
     int inputBlockNum = 1;
+    auto weightRepackViaInt8Main = std::make_shared<bool>(false);
+    auto weightRepackViaInt8Branch = std::make_shared<bool>(false);
+    auto weightDirectInt4ReadMain = std::make_shared<bool>(false);
+    auto weightDirectInt4ReadBranch = std::make_shared<bool>(false);
     if (quanCommon) {
         int dequantCnt = quanCommon->alphaSize;
         if (quanCommon->asymmetric) {
@@ -809,6 +867,8 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
     auto function = [=]() -> int {
         bool fastReadWeight =
             (kernelCount == 1 && ROUND_UP(ocMain, UNITMain) == ocMain && ROUND_UP(ic, SRC_UNITMain) == ic);
+        *weightDirectInt4ReadMain = target->mWeightBits == 4 && fastReadWeight;
+        *weightRepackViaInt8Main = target->mWeightBits == 4 && !fastReadWeight;
         weightSummerFuncion sumFunc = funcsMain.MNNSumWeightInt8;
         if (mOnlineReorderWeightSme) {
             sumFunc = funcsMain.MNNSumWeightInt8SmeHp128;
@@ -837,6 +897,8 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
 
             fastReadWeight =
                 (kernelCount == 1 && ROUND_UP(ocBranch, UNITMain) == ocBranch && ROUND_UP(ic, SRC_UNITMain) == ic);
+            *weightDirectInt4ReadBranch = target->mWeightBits == 4 && fastReadWeight;
+            *weightRepackViaInt8Branch = target->mWeightBits == 4 && !fastReadWeight;
             reorderFunc(funcsBranch, shapeBranch, UNITBranch, SRC_UNITBranch, DST_XUNITBranch, weightlenBranch,
                         scaleSizeBranch, ocBranch, 1, fastReadWeight, addressPtr, sumFunc);
         }
@@ -844,6 +906,27 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
     };
 
     static_cast<CPUBackend*>(backend)->enqueueTask(std::move(function));
+
+    if (mResourceInt8->mWeightBits == 4) {
+        std::ostringstream info;
+        info << "weightLoad=4bit-packed";
+        if (*weightDirectInt4ReadMain || *weightDirectInt4ReadBranch) {
+            info << " directInt4Read=true";
+        }
+        info << " repackViaInt8=" << ((*weightRepackViaInt8Main || *weightRepackViaInt8Branch) ? "true" : "false");
+        if (mOcBranch > 0) {
+            info << " mainRepackViaInt8=" << (*weightRepackViaInt8Main ? "true" : "false")
+                 << " branchRepackViaInt8=" << (*weightRepackViaInt8Branch ? "true" : "false");
+        }
+        mWeightRepackInfo = info.str();
+    } else {
+        std::ostringstream info;
+        info << "weightLoad=" << mResourceInt8->mWeightBits << "bit";
+        mWeightRepackInfo = info.str();
+    }
+    if (!mOpName.empty()) {
+        setProfileExecutionBytes(mOpName, weightlenMain + quantlenMain + weightlenBranch + quantlenBranch);
+    }
 
     if (!isDynamicQuant) {
         mResourceInt8->mDynamicQuant = false;
@@ -910,7 +993,14 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
 
 DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const Op* op,
                                                        const DenseConvInt8TiledExecutor& exe)
-    : ConvInt8TiledExecutor(backend, op, exe.mResourceInt8), mGemmKernel(exe.mGemmKernel) {}
+    : ConvInt8TiledExecutor(backend, op, exe.mResourceInt8),
+      mGemmKernel(exe.mGemmKernel),
+      mOpName(exe.mOpName),
+      mWeightRepackInfo(exe.mWeightRepackInfo) {
+    if (mOpName.empty()) {
+        mOpName = _opNameForProfile(op);
+    }
+}
 
 DenseConvInt8TiledExecutor::~DenseConvInt8TiledExecutor() {
     // Do nothing
@@ -1279,6 +1369,41 @@ ErrorCode DenseConvInt8TiledExecutor::onResize(const std::vector<Tensor*>& input
             mQuantAndReorderFunc = core->DynamicQuanInputAndReorder_ARM82;
         }
         // A axisSum kernel
+    }
+
+    if (!mOpName.empty()) {
+        std::ostringstream info;
+        info << "CPU DenseConvInt8TiledExecutor"
+             << " mode=" << (mResourceInt8->mDynamicQuant ? "dynamic" : "static")
+             << " phase=" << (planeSize == 1 ? "decode" : "prefill")
+             << " gemmM=" << planeSize
+             << " gemmK=" << (kernelCountUnit * SRC_UNIT)
+             << " gemmN=" << outC
+             << " batch=" << batch
+             << " ic=" << inC
+             << " oc=" << outC
+             << " kernel=" << kernelCount
+             << " blockL=" << (kernelCountUnit / mBlockNum)
+             << " weightBits=" << mResourceInt8->mWeightBits
+             << " blockNum=" << mBlockNum
+             << " pack=" << gcore->pack
+             << " bytes=" << gcore->bytes
+             << " split=" << (mSplitByOc ? "oc" : "plane")
+             << " im2col=" << (mIm2ColBasedInt8 ? "int8" : "float")
+             << " batchQuant=" << (mUseBatchQuan ? "true" : "false")
+             << " onlineRepackForPrefill="
+             << ((mOnlineReorderWeightSme && planeSize > 1) ? "true" : "false");
+        if (!mWeightRepackInfo.empty()) {
+            info << " " << mWeightRepackInfo;
+        }
+        if (mMixedKernel && mGemmKernels.size() >= 2) {
+            info << " mixedKernel=true"
+                 << " mainKernel=" << _int8KernelName(mGemmKernels[0], mRelatedFunctions)
+                 << " branchKernel=" << _int8KernelName(mGemmKernels[1], mArm82Functions);
+        } else {
+            info << " gemmKernel=" << _int8KernelName(mGemmKernel, mRelatedFunctions);
+        }
+        setProfileExecutionInfo(mOpName, info.str());
     }
 
     mInputBlockNum = (inputBlockQuantOption == 2) ? mBlockNum : 1;

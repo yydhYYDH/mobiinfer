@@ -100,6 +100,8 @@ private:
     // for 4Bit Ptq model
     bool m4BitPtq = false;
     bool mMixedKernel;
+    std::string mOpName;
+    std::string mWeightRepackInfo;
     MatmulRelatedFunctions mRelatedFunctions;
     MatmulRelatedFunctions mArm82Functions;
 };
