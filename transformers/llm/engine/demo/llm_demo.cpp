@@ -389,6 +389,7 @@ int main(int argc, const char* argv[]) {
         prompt.prompt_template = "<img>" + image_path + "</img>" + question;
         std::ostringstream answer;
         llm->set_config(R"({"async":false})");
+        image_profiler->reset();
         llm->response(prompt, &answer, nullptr, max_token_number);
         MNN_PRINT("%s", answer.str().c_str());
         auto context = llm->getContext();
@@ -409,8 +410,10 @@ int main(int argc, const char* argv[]) {
         MNN_PRINT("\n========== Operator Profile Results ==========\n");
         image_profiler->printTimeByName(1);
         image_profiler->printTimeByType(1);
-        mkdir("../logs", 0755);
-        image_profiler->dumpCSV("../logs/qwen3_vl_img_op_profile_phase.csv", 1);
+        mkdir("logs", 0755);
+        image_profiler->dumpCSV("logs/qwen3_vl_img_op_profile_phase.csv", 1);
+        image_profiler->dumpTimelineCSV("logs/qwen3_vl_img_op_profile_timeline.csv", 1);
+        image_profiler->dumpPhaseCSV("logs/qwen3_vl_img_op_profile_inferred_phase.csv", 1);
         return 0;
     }
 

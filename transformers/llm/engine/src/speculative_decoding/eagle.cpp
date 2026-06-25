@@ -7,14 +7,48 @@
 
 #include "generate.hpp"
 #include "tokentree.hpp"
+#include "core/ProfileExecutionInfo.hpp"
+#include <MNN/AutoTime.hpp>
 #include <numeric>
 #include <algorithm>
+#include <cstdlib>
 
 #define EAGLE_DEBUG 0
 
 using namespace MNN::Express;
 namespace MNN {
 namespace Transformer {
+
+namespace {
+class ProfilePhaseScope {
+public:
+    ProfilePhaseScope(const std::string& phase) : mPrevious(getCurrentProfilePhase()) {
+        setCurrentProfilePhase(phase);
+    }
+    ~ProfilePhaseScope() {
+        setCurrentProfilePhase(mPrevious);
+    }
+
+private:
+    std::string mPrevious;
+};
+
+static bool profileEagleTimingEnabled() {
+    static bool enabled = []() {
+        const char* value = std::getenv("MNN_PROFILE_EAGLE_TIMING");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void printEagleTiming(const char* stage, int iter, int seqLen, int ids, int64_t us) {
+    if (!profileEagleTimingEnabled()) {
+        return;
+    }
+    MNN_PRINT("[MNN_PROFILE_EAGLE] stage=%s iter=%d seqLen=%d ids=%d time_ms=%.3f\n", stage, iter, seqLen, ids,
+              us / 1000.0f);
+}
+} // namespace
 
 template <typename T>
 static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
@@ -79,6 +113,7 @@ void EagleGeneration::setPosition(int position) {
 }
 
 std::vector<MNN::Express::VARP> EagleGeneration::eagleForwardRaw(const std::vector<MNN::Express::VARP>& inputs) {
+    ProfilePhaseScope profilePhase("eagle");
     int seq_len     = inputs[0]->getInfo()->dim[0];
     mEagleMeta->add = seq_len;
 #if EAGLE_DEBUG
@@ -113,6 +148,7 @@ std::vector<VARP> EagleGeneration::eagleForward(const std::vector<int>& input_id
 }
 
 EagleGeneration::DraftInfo EagleGeneration::topkGenerate(const std::vector<int>& inputIds, MNN::Express::VARP hiddenStates, MNN::Express::VARP inputEmbeds) {
+    ProfilePhaseScope profilePhase("eagle");
     auto d2tPtr = mD2t->readMap<int>();
     TokenTree tokenTree(mTopK, d2tPtr);
 #if EAGLE_DEBUG
@@ -139,9 +175,11 @@ EagleGeneration::DraftInfo EagleGeneration::topkGenerate(const std::vector<int>&
     mEagleRemove      = mTopK * (mDepth - 1);
     auto lastP        = outputs[0];
     auto lastHidden   = outputs[1];
+    MNN::Timer profileTopKTimer;
     auto topKV = MNN::Express::_TopKV2(lastP, MNN::Express::_Scalar<int>(mTopK));
     auto scores = topKV[0]->readMap<float>();
     auto indices = topKV[1]->readMap<int>();
+    printEagleTiming("topk_read", 0, seqLen, topKV[0]->getInfo()->size, profileTopKTimer.durationInUs());
 #if EAGLE_DEBUG
     for (int i = 0; i < topKV[0]->getInfo()->size; i++) {
         auto token = indices[i];
@@ -149,27 +187,42 @@ EagleGeneration::DraftInfo EagleGeneration::topkGenerate(const std::vector<int>&
         printf("# top-%d: %d[%f], %s\n", i, token, scores[i], tokenStr(token).c_str());
     }
 #endif
+    MNN::Timer profileTreeTimer;
     tokenTree.init(indices, scores);
+    printEagleTiming("token_tree_init", 0, seqLen, mTopK, profileTreeTimer.durationInUs());
     inputHidden = MNN::Express::_Tile(lastHidden, _var<int>({1, mTopK, 1}, {3}));
     for (int d = 0; d < mDepth - 1; d++) {
         setPosition(seqLen + d);
-        inputEmbeds   = mLlm->embedding(tokenTree.getIds());
+        auto ids = tokenTree.getIds();
+        MNN::Timer profileEmbeddingTimer;
+        inputEmbeds   = mLlm->embedding(ids);
+        printEagleTiming("embedding", d + 1, seqLen, ids.size(), profileEmbeddingTimer.durationInUs());
         if(inputEmbeds == nullptr) {
             // Return empty DraftInfo - will cause generation to stop
             DraftInfo info;
             return info;
         }
+        MNN::Timer profileMaskTimer;
         auto attentionMask = getMask(tokenTree.getMask(), seqLen);
+        printEagleTiming("mask_build", d + 1, seqLen, ids.size(), profileMaskTimer.durationInUs());
         mEagleMeta->remove = 0;
+        MNN::Timer profileForwardTimer;
         outputs = eagleForwardRaw({inputEmbeds, inputHidden, attentionMask, mTreePosition, mLlm->logitsAllIdx});
+        printEagleTiming("eagle_forward", d + 1, seqLen, ids.size(), profileForwardTimer.durationInUs());
         lastP   = outputs[0];
         inputHidden  = outputs[1];
+        MNN::Timer profileLoopTopKTimer;
         auto topKV   = MNN::Express::_TopKV2(lastP, MNN::Express::_Scalar<int>(mTopK));
         auto scores  = topKV[0]->readMap<float>();
         auto indices = topKV[1]->readMap<int>();
+        printEagleTiming("topk_read", d + 1, seqLen, topKV[0]->getInfo()->size, profileLoopTopKTimer.durationInUs());
+        MNN::Timer profileGrowTimer;
         tokenTree.grow(indices, scores);
+        printEagleTiming("token_tree_grow", d + 1, seqLen, ids.size(), profileGrowTimer.durationInUs());
     }
+    MNN::Timer profileFinalizeTimer;
     auto output = tokenTree.finalize(sampleToken, mLlm->mDraftLength);
+    printEagleTiming("token_tree_finalize", mDepth, seqLen, output.draftTokens.size(), profileFinalizeTimer.durationInUs());
 #if EAGLE_DEBUG
     {
         std::cout << tokenTree.toString([&](int token){
@@ -372,6 +425,11 @@ void EagleGeneration::generate(GenerationParams& param) {
         
         treeDecodingTime += _dt.durationInUs();
         auto acceptInfo = evaluatePosterior(draftInfo, decodingInfo[0]);
+        if (profileEagleTimingEnabled()) {
+            MNN_PRINT("[MNN_PROFILE_EAGLE] stage=accept step=%d draft_tokens=%d accepted=%d total_new=%d\n", steps,
+                      static_cast<int>(draftInfo.draftTokens.size()), static_cast<int>(acceptInfo.acceptTokens.size()),
+                      newTokens + static_cast<int>(acceptInfo.acceptTokens.size()));
+        }
         newTokens += acceptInfo.acceptTokens.size();
         accpetLens.push_back(acceptInfo.acceptTokens.size());
         {

@@ -202,6 +202,13 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     rtg->setHint(MNN::Interpreter::CPU_SME2_NEON_DIVISION_RATIO, mConfig->config_.value("cpu_sme2_neon_division_ratio", 41));
     rtg->setHint(MNN::Interpreter::CPU_SME_CORES, mConfig->config_.value("cpu_sme_core_num", 2));
     rtg->setHint(MNN::Interpreter::MMAP_FILE_SIZE, mConfig->mmap_size());
+    const char* cpuCoreIdsKey = mllm ? "mllm_cpu_core_ids" : "cpu_core_ids";
+    if (mConfig->config_.contains(cpuCoreIdsKey)) {
+        auto ids = mConfig->config_.value(cpuCoreIdsKey, std::vector<int>{});
+        if (!ids.empty()) {
+            rtg->setHint(MNN::Interpreter::CPU_CORE_IDS, ids.data(), ids.size());
+        }
+    }
 }
 
 void Llm::initRuntime() {
@@ -1073,6 +1080,7 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
         }
     }
 
+    mGenerateParam->input_ids = input_ids;
     mContext->history_tokens.insert(mContext->history_tokens.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
     if(!passExecute) {
         // For visual/audio (Omni) input, the outer chunking below would call

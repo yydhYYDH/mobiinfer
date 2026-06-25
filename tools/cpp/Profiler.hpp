@@ -49,7 +49,10 @@ public:
      */
     void printTimeByName(int loops = 1);
 
+    void reset();
     void dumpCSV(const std::string& file, int loops = 1);
+    void dumpTimelineCSV(const std::string& file, int loops = 1);
+    void dumpPhaseCSV(const std::string& file, int loops = 1);
 
     /**
      * print op that flops / time is slow
@@ -73,21 +76,43 @@ private:
         uint64_t inputBytes;
         uint64_t outputBytes;
     };
+    struct Event {
+        int64_t sequence;
+        std::string name;
+        std::string type;
+        std::string phase;
+        std::string inferredPhase;
+        std::string execution;
+        float startTime;
+        float endTime;
+        float costTime;
+        float dispatchTime;
+        float waitTime;
+        float flops;
+        uint64_t inputBytes;
+        uint64_t outputBytes;
+        uint64_t staticBytes;
+    };
 
     static Profiler* gInstance;
     uint64_t mStartTime = 0;
     uint64_t mEndTime   = 0;
+    uint64_t mProfileOriginTime = 0;
     float mTotalTime    = 0.0f;
     float mTotalMFlops  = 0.0f;
     std::map<std::string, Record> mMapByType;
     std::map<std::string, Record> mMapByName;
     std::map<std::string, Record> mMapByNamePhase;
     std::string mActiveNamePhaseKey;
+    std::vector<Event> mEvents;
+    std::map<std::string, int64_t> mActiveEventIndex;
+    int64_t mSequence = 0;
 
 private:
     Record& getTypedRecord(const OperatorInfo* info);
     Record& getNamedRecord(const OperatorInfo* info);
     Record& getNamePhaseRecord(const OperatorInfo* info);
+    std::vector<Event> refinePhasesByTimeline() const;
 };
 
 } // namespace MNN

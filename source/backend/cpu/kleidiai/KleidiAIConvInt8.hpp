@@ -26,6 +26,9 @@ private:
     KleidiAI &kai;
     KleidiAI::AccelType mAccelType = KleidiAI::AccelType::ACC_TYPE_NUMBER;
     int32_t mBlockNum = 1;
+    std::string mOpName;
+    int32_t mModelWeightBits = 0;
+    uint64_t mPackedWeightBytes = 0;
 };
 
 } // namespace MNN

@@ -25,6 +25,9 @@
 #include "backend/cpu/OneDNNConvolution.hpp"
 #include "backend/cpu/compute/ConvInt8TiledExecutor.hpp"
 
+#include <cstdlib>
+#include <sstream>
+
 #ifdef MNN_KLEIDIAI_ENABLED
 #include "backend/cpu/kleidiai/KleidiAIConvInt8.hpp"
 #include "backend/cpu/kleidiai/KleidiAIConvolution.hpp"
@@ -40,9 +43,99 @@ static std::string _opName(const Op* op) {
     return op->name()->str();
 }
 
+static bool _profileExecLogEnabled() {
+    static bool enabled = []() {
+        const char* value = std::getenv("MNN_PROFILE_EXEC");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 static Execution* _profiledExecution(const Op* op, Execution* execution, const std::string& info) {
     setProfileExecutionInfo(_opName(op), info);
     return execution;
+}
+
+static std::string _boolString(bool value) {
+    return value ? "true" : "false";
+}
+
+static std::string _dynamicQuantProfileInfo(const Tensor* input, const Tensor* output, Backend* backend, const Op* op,
+                                            const std::shared_ptr<ConvolutionCommon::Int8Common>& weightQuantInfo) {
+    auto conv2d = op->main_as_Convolution2D();
+    auto common = conv2d->common();
+    auto cpuBackend = static_cast<CPUBackend*>(backend);
+    auto gcore = cpuBackend->functions();
+    auto int8GemmFunctions = cpuBackend->int8GemmFunctions();
+    int unit = 0;
+    int srcUnit = 0;
+    int dstXUnit = 0;
+    int8GemmFunctions->MNNGetGemmUnit(&unit, &srcUnit, &dstXUnit);
+
+    int runtimeWeightBits = 8;
+    bool hasW4Kernel = int8GemmFunctions->Int8GemmKernel_W4 != nullptr ||
+                       int8GemmFunctions->MNNGemmInt8AddBiasScale_w4_Unit_FP16 != nullptr;
+    bool hasW3Kernel = int8GemmFunctions->Int8GemmKernel_W3 != nullptr ||
+                       int8GemmFunctions->MNNGemmInt8AddBiasScale_w3_Unit_FP16 != nullptr;
+    bool hasW2Kernel = int8GemmFunctions->Int8GemmKernel_W2 != nullptr ||
+                       int8GemmFunctions->MNNGemmInt8AddBiasScale_w2_Unit_FP16 != nullptr;
+    if (weightQuantInfo && weightQuantInfo->canUseInt4) {
+        runtimeWeightBits = 4;
+    } else if (weightQuantInfo && weightQuantInfo->canUseInt2 && hasW2Kernel) {
+        runtimeWeightBits = 2;
+    } else if (weightQuantInfo && weightQuantInfo->canUseInt3 && hasW3Kernel) {
+        runtimeWeightBits = 3;
+    }
+
+    int oc = common->outputCount();
+    int ic = common->inputCount();
+    int blockNum = 1;
+    if (weightQuantInfo && oc > 0) {
+        int dequantCnt = weightQuantInfo->alphaSize;
+        if (weightQuantInfo->asymmetric) {
+            dequantCnt /= 2;
+        }
+        blockNum = dequantCnt / oc;
+    }
+    int kernelCount = common->kernelX() * common->kernelY();
+    int batch = input->batch();
+    int planeSize = output->width() * output->height() * output->batch();
+    int gemmK = UP_DIV(ic, blockNum) * kernelCount * srcUnit;
+
+    bool fastReadWeight = runtimeWeightBits == 4 && kernelCount == 1 && ROUND_UP(oc, unit) == oc &&
+                          ROUND_UP(ic, srcUnit) == ic;
+
+    std::ostringstream info;
+    info << "CPU DenseConvInt8TiledExecutor"
+         << " mode=dynamic"
+         << " phase=" << (planeSize == 1 ? "decode" : "prefill")
+         << " gemmM=" << planeSize
+         << " gemmK=" << gemmK
+         << " gemmN=" << oc
+         << " batch=" << batch
+         << " ic=" << ic
+         << " oc=" << oc
+         << " kernel=" << kernelCount
+         << " blockL=" << UP_DIV(ic, blockNum)
+         << " modelBits=" << (weightQuantInfo ? weightQuantInfo->originBits : 0)
+         << " runtimeWeightBits=" << runtimeWeightBits
+         << " weightBits=" << runtimeWeightBits
+         << " blockNum=" << blockNum
+         << " pack=" << gcore->pack
+         << " bytes=" << gcore->bytes
+         << " canUseInt4=" << _boolString(weightQuantInfo && weightQuantInfo->canUseInt4)
+         << " canUseInt3=" << _boolString(weightQuantInfo && weightQuantInfo->canUseInt3)
+         << " canUseInt2=" << _boolString(weightQuantInfo && weightQuantInfo->canUseInt2)
+         << " hasW4Kernel=" << _boolString(hasW4Kernel)
+         << " hasW3Kernel=" << _boolString(hasW3Kernel)
+         << " hasW2Kernel=" << _boolString(hasW2Kernel)
+         << " weightStorage=" << runtimeWeightBits << "bit";
+    if (runtimeWeightBits == 4) {
+        info << "-packed"
+             << " directInt4Read=" << _boolString(fastReadWeight)
+             << " repackViaInt8=" << _boolString(!fastReadWeight);
+    }
+    return info.str();
 }
 
 #ifdef MNN_KLEIDIAI_ENABLED
@@ -169,8 +262,12 @@ static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend
 #ifdef MNN_LOW_MEMORY
     if (lowMemory && nullptr != weightQuantInfo.get() && originWeightSize == 0) {
         if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
+            auto profileInfo = _dynamicQuantProfileInfo(input, output, backend, op, weightQuantInfo);
+            if (_profileExecLogEnabled()) {
+                MNN_PRINT("[MNN_PROFILE_EXEC] op=%s %s\n", _opName(op).c_str(), profileInfo.c_str());
+            }
             return _profiledExecution(op, new DenseConvInt8TiledExecutor(backend, op, weightQuantInfo, true),
-                                      "CPU DenseConvInt8TiledExecutor dynamic");
+                                      profileInfo);
         } else {
             return _profiledExecution(op,
                                       new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize,

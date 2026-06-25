@@ -17,6 +17,57 @@ std::mutex gProfileExecutionInfoMutex;
 std::map<std::string, std::string> gProfileExecutionInfo;
 std::map<std::string, std::string> gCurrentProfileExecutionInfo;
 std::map<std::string, uint64_t> gProfileExecutionBytes;
+thread_local std::string gCurrentProfilePhase;
+
+static bool _endsWith(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::string _stripSuffix(std::string name, const std::string& suffix) {
+    if (_endsWith(name, suffix)) {
+        name.resize(name.size() - suffix.size());
+    }
+    return name;
+}
+
+static std::string _profileNameKey(const std::string& name) {
+    auto key = name;
+    key = _stripSuffix(key, "_matmul_converted");
+    key = _stripSuffix(key, "__matmul_converted");
+    key = _stripSuffix(key, "_converted");
+    return key;
+}
+
+static bool _sameProfileName(const std::string& lhs, const std::string& rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+    auto lhsKey = _profileNameKey(lhs);
+    auto rhsKey = _profileNameKey(rhs);
+    if (lhsKey == rhsKey) {
+        return true;
+    }
+    // Converted matmul names sometimes append an intermediate output segment after the logical op name.
+    if (lhs.find("_raster_") != std::string::npos || rhs.find("_raster_") != std::string::npos) {
+        return false;
+    }
+    return lhsKey.find(rhsKey + "/") == 0 || rhsKey.find(lhsKey + "/") == 0;
+}
+
+template <typename T>
+static typename std::map<std::string, T>::const_iterator _findProfileValue(const std::map<std::string, T>& values,
+                                                                           const std::string& opName) {
+    auto iter = values.find(opName);
+    if (iter != values.end()) {
+        return iter;
+    }
+    for (iter = values.begin(); iter != values.end(); ++iter) {
+        if (_sameProfileName(iter->first, opName)) {
+            return iter;
+        }
+    }
+    return values.end();
+}
 
 } // namespace
 
@@ -42,7 +93,7 @@ void setProfileExecutionInfo(const std::string& opName, const std::string& info)
 
 std::string getProfileExecutionInfo(const std::string& opName) {
     std::lock_guard<std::mutex> lock(gProfileExecutionInfoMutex);
-    auto iter = gProfileExecutionInfo.find(opName);
+    auto iter = _findProfileValue(gProfileExecutionInfo, opName);
     if (iter == gProfileExecutionInfo.end()) {
         return "";
     }
@@ -51,11 +102,15 @@ std::string getProfileExecutionInfo(const std::string& opName) {
 
 std::string getCurrentProfileExecutionInfo(const std::string& opName) {
     std::lock_guard<std::mutex> lock(gProfileExecutionInfoMutex);
-    auto iter = gCurrentProfileExecutionInfo.find(opName);
-    if (iter == gCurrentProfileExecutionInfo.end()) {
-        return "";
+    auto iter = _findProfileValue(gCurrentProfileExecutionInfo, opName);
+    if (iter != gCurrentProfileExecutionInfo.end()) {
+        return iter->second;
     }
-    return iter->second;
+    iter = _findProfileValue(gProfileExecutionInfo, opName);
+    if (iter != gProfileExecutionInfo.end()) {
+        return iter->second;
+    }
+    return "";
 }
 
 void setProfileExecutionBytes(const std::string& opName, uint64_t bytes) {
@@ -68,11 +123,19 @@ void setProfileExecutionBytes(const std::string& opName, uint64_t bytes) {
 
 uint64_t getProfileExecutionBytes(const std::string& opName) {
     std::lock_guard<std::mutex> lock(gProfileExecutionInfoMutex);
-    auto iter = gProfileExecutionBytes.find(opName);
+    auto iter = _findProfileValue(gProfileExecutionBytes, opName);
     if (iter == gProfileExecutionBytes.end()) {
         return 0;
     }
     return iter->second;
+}
+
+void setCurrentProfilePhase(const std::string& phase) {
+    gCurrentProfilePhase = phase;
+}
+
+std::string getCurrentProfilePhase() {
+    return gCurrentProfilePhase;
 }
 
 void clearProfileExecutionInfo() {

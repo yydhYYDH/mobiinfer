@@ -12,15 +12,74 @@
 #include <math.h>
 #include "backend/cpu/CPUBackend.hpp"
 #include "core/Concurrency.h"
+#include "core/ProfileExecutionInfo.hpp"
 #include "core/TensorUtils.hpp"
 #include "backend/cpu/CPUTensorConvert.hpp"
 
+#include <sstream>
+
 #define QUANT_INFO_BYTES 4
 namespace MNN {
+namespace {
+
+static std::string _opNameForProfile(const Op* op) {
+    if (op == nullptr || op->name() == nullptr) {
+        return "";
+    }
+    return op->name()->str();
+}
+
+static const char* _kleidiAIAccelName(KleidiAI::AccelType type) {
+    switch (type) {
+        case KleidiAI::AccelType::QI4_ASYM_CHNLQT_F32:
+            return "QI4_ASYM_CHNLQT_F32";
+        case KleidiAI::AccelType::QI4_ASYM_CHNLQT_F16:
+            return "QI4_ASYM_CHNLQT_F16";
+        case KleidiAI::AccelType::QI4_ASYM_BLKQT_F32:
+            return "QI4_ASYM_BLKQT_F32";
+        case KleidiAI::AccelType::QI4_ASYM_BLKQT_F16:
+            return "QI4_ASYM_BLKQT_F16";
+        case KleidiAI::AccelType::QI4_SYM_CHNLQT_F32:
+            return "QI4_SYM_CHNLQT_F32";
+        case KleidiAI::AccelType::QI4_SYM_BLKQT:
+            return "QI4_SYM_BLKQT";
+        case KleidiAI::AccelType::QI8_ASYM_CHNLQT:
+            return "QI8_ASYM_CHNLQT";
+        case KleidiAI::AccelType::QI8_ASYM_BLKQT:
+            return "QI8_ASYM_BLKQT";
+        case KleidiAI::AccelType::QI8_SYM_CHNLQT:
+            return "QI8_SYM_CHNLQT";
+        case KleidiAI::AccelType::QI8_SYM_BLKQT:
+            return "QI8_SYM_BLKQT";
+        case KleidiAI::AccelType::FP16:
+            return "FP16";
+        case KleidiAI::AccelType::FP32:
+            return "FP32";
+        case KleidiAI::AccelType::BF16:
+            return "BF16";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static int _kleidiAIWeightBits(KleidiAI::AccelType type) {
+    auto name = std::string(_kleidiAIAccelName(type));
+    if (name.find("QI4") == 0) {
+        return 4;
+    }
+    if (name.find("QI8") == 0) {
+        return 8;
+    }
+    return 0;
+}
+
+} // namespace
 
 KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon, bool isDynamicQuant,
     KleidiAI &kai, KleidiAI::AccelType accelType, int32_t blockNum)
     : CPUConvolution(op->main_as_Convolution2D()->common(), backend), kai(kai), mAccelType(accelType), mBlockNum(blockNum) {
+    mOpName = _opNameForProfile(op);
+    mModelWeightBits = quanCommon ? quanCommon->originBits : 0;
     // convolution info
     auto convOp = op->main_as_Convolution2D();
     int oc = convOp->common()->outputCount();
@@ -81,6 +140,7 @@ KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, std::shared_p
     int n = oc;
     int k = ic;
     int packedWeightSize = kai.getRhsPackedSize(mAccelType, n, k, blkSize);
+    mPackedWeightBytes = packedWeightSize;
 
     //Alloc packed weight tensor.
     mWeightInt8.reset(Tensor::createDevice<uint8_t>({packedWeightSize}));
@@ -128,7 +188,13 @@ KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, std::shared_p
 KleidiAIConvInt8::KleidiAIConvInt8(Backend* backend, const Op* op, const KleidiAIConvInt8& exe)
     : CPUConvolution(op->main_as_Convolution2D()->common(), backend), kai(exe.kai), mAccelType(exe.mAccelType),
     mWeightInt8(exe.mWeightInt8),mBlockNum(exe.mBlockNum),
-      mTempIm2ColBuffer(exe.mTempIm2ColBuffer) {
+      mTempIm2ColBuffer(exe.mTempIm2ColBuffer),
+      mOpName(_opNameForProfile(op)),
+      mModelWeightBits(exe.mModelWeightBits),
+      mPackedWeightBytes(exe.mPackedWeightBytes) {
+    if (mOpName.empty()) {
+        mOpName = exe.mOpName;
+    }
 }
 
 KleidiAIConvInt8::~KleidiAIConvInt8() {
@@ -160,6 +226,32 @@ ErrorCode KleidiAIConvInt8::onResize(const std::vector<Tensor*>& inputs, const s
     const size_t n = outputs[0]->channel(); //rhs vector number.
     const size_t k = inputs[0]->channel(); //vector size.
     const size_t blkSize = mBlockNum == 1 ? 0 : k / mBlockNum;
+    if (!mOpName.empty()) {
+        int weightBits = _kleidiAIWeightBits(mAccelType);
+        std::ostringstream info;
+        info << "CPU KleidiAIConvInt8"
+             << " mode=dynamic"
+             << " phase=" << (m == 1 ? "decode" : "prefill")
+             << " gemmM=" << m
+             << " gemmK=" << k
+             << " gemmN=" << n
+             << " batch=" << inputs[0]->batch()
+             << " ic=" << k
+             << " oc=" << n
+             << " kernel=" << (mCommon->kernelX() * mCommon->kernelY())
+             << " blockL=" << (mBlockNum > 0 ? k / mBlockNum : k)
+             << " modelBits=" << mModelWeightBits
+             << " runtimeWeightBits=" << weightBits
+             << " weightBits=" << weightBits
+             << " blockNum=" << mBlockNum
+             << " pack=" << core->pack
+             << " bytes=" << core->bytes
+             << " weightStorage=" << weightBits << "bit-packed"
+             << " accelType=" << _kleidiAIAccelName(mAccelType)
+             << " gemmKernel=" << _kleidiAIAccelName(mAccelType);
+        setProfileExecutionInfo(mOpName, info.str());
+        setProfileExecutionBytes(mOpName, mPackedWeightBytes);
+    }
 
     auto inputOriginFmt = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
     auto outputOriginFmt = TensorUtils::getDescribe(outputs[0])->dimensionFormat;

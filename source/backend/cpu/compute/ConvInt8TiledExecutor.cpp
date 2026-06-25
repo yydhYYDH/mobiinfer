@@ -497,6 +497,10 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
     mResourceInt8.reset(new CPUConvolution::ResourceInt8);
     mResourceInt8->mWeightAsymmetricQuant = asyWeight;
     mResourceInt8->mWeightBits = 8;
+    mModelWeightBits = quanCommon ? quanCommon->originBits : 0;
+    mModelCanUseInt4 = quanCommon ? quanCommon->canUseInt4 : false;
+    mModelCanUseInt3 = quanCommon ? quanCommon->canUseInt3 : false;
+    mModelCanUseInt2 = quanCommon ? quanCommon->canUseInt2 : false;
     mResourceInt8->mBlockNum = blockNum;
     mResourceInt8->mHp = UNITMain;
     mResourceInt8->mLp = SRC_UNITMain;
@@ -909,7 +913,7 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
 
     if (mResourceInt8->mWeightBits == 4) {
         std::ostringstream info;
-        info << "weightLoad=4bit-packed";
+        info << "weightStorage=4bit-packed";
         if (*weightDirectInt4ReadMain || *weightDirectInt4ReadBranch) {
             info << " directInt4Read=true";
         }
@@ -921,7 +925,7 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
         mWeightRepackInfo = info.str();
     } else {
         std::ostringstream info;
-        info << "weightLoad=" << mResourceInt8->mWeightBits << "bit";
+        info << "weightStorage=" << mResourceInt8->mWeightBits << "bit";
         mWeightRepackInfo = info.str();
     }
     if (!mOpName.empty()) {
@@ -995,10 +999,14 @@ DenseConvInt8TiledExecutor::DenseConvInt8TiledExecutor(Backend* backend, const O
                                                        const DenseConvInt8TiledExecutor& exe)
     : ConvInt8TiledExecutor(backend, op, exe.mResourceInt8),
       mGemmKernel(exe.mGemmKernel),
-      mOpName(exe.mOpName),
+      mOpName(_opNameForProfile(op)),
+      mModelWeightBits(exe.mModelWeightBits),
+      mModelCanUseInt4(exe.mModelCanUseInt4),
+      mModelCanUseInt3(exe.mModelCanUseInt3),
+      mModelCanUseInt2(exe.mModelCanUseInt2),
       mWeightRepackInfo(exe.mWeightRepackInfo) {
     if (mOpName.empty()) {
-        mOpName = _opNameForProfile(op);
+        mOpName = exe.mOpName;
     }
 }
 
@@ -1384,10 +1392,18 @@ ErrorCode DenseConvInt8TiledExecutor::onResize(const std::vector<Tensor*>& input
              << " oc=" << outC
              << " kernel=" << kernelCount
              << " blockL=" << (kernelCountUnit / mBlockNum)
+             << " modelBits=" << mModelWeightBits
+             << " runtimeWeightBits=" << mResourceInt8->mWeightBits
              << " weightBits=" << mResourceInt8->mWeightBits
              << " blockNum=" << mBlockNum
              << " pack=" << gcore->pack
              << " bytes=" << gcore->bytes
+             << " canUseInt4=" << (mModelCanUseInt4 ? "true" : "false")
+             << " canUseInt3=" << (mModelCanUseInt3 ? "true" : "false")
+             << " canUseInt2=" << (mModelCanUseInt2 ? "true" : "false")
+             << " hasW4Kernel="
+             << ((mRelatedFunctions.Int8GemmKernel_W4 != nullptr ||
+                  mRelatedFunctions.MNNGemmInt8AddBiasScale_w4_Unit_FP16 != nullptr) ? "true" : "false")
              << " split=" << (mSplitByOc ? "oc" : "plane")
              << " im2col=" << (mIm2ColBasedInt8 ? "int8" : "float")
              << " batchQuant=" << (mUseBatchQuan ? "true" : "false")
