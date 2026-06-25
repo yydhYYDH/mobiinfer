@@ -260,6 +260,7 @@ private:
     void setSpeculativeConfig();
     void updateContext(int seq_len, int gen_len);
     bool checkFile(const std::string& path, const char* name);
+    bool checkModelCompatibility();
 
 private:
     bool mInSpec = false;
