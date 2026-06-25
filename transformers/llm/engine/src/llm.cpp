@@ -290,6 +290,24 @@ bool Llm::checkFile(const std::string& path, const char* name) {
     return true;
 }
 
+bool Llm::checkModelCompatibility() {
+    const auto storage = mConfig->config_.value("weight_scale_storage", std::string("fp32"));
+    if (storage != "fp16") {
+        return true;
+    }
+#ifndef MNN_SUPPORT_WEIGHT_SCALE_FP16
+#define MNN_SUPPORT_WEIGHT_SCALE_FP16 1
+#endif
+#if MNN_SUPPORT_WEIGHT_SCALE_FP16
+    return true;
+#else
+    MNN_ERROR("[Error]: This model uses FP16 quant scale (weight_scale_storage=fp16), "
+              "but this runtime does not support it. Please export with --scale_bit 32 "
+              "or upgrade the MNN runtime.\n");
+    return false;
+#endif
+}
+
 bool Llm::load() {
     // check required files before loading
     std::string tokenizer_path = mConfig->tokenizer_file();
@@ -298,6 +316,9 @@ bool Llm::load() {
     if (!checkFile(tokenizer_path, "tokenizer file") ||
         !checkFile(model_path, "LLM model file") ||
         !checkFile(weight_path, "LLM weight file")) {
+        return false;
+    }
+    if (!checkModelCompatibility()) {
         return false;
     }
     MNN::Express::ExecutorScope s(mExecutor);
