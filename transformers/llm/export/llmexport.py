@@ -356,6 +356,10 @@ class LlmExporter(torch.nn.Module):
                 "n_gram": 8,
                 "ngram_factor": 1.0
             }
+            scale_storage = "fp16" if getattr(self.args, "scale_bit", 32) == 16 else "fp32"
+            config["weight_scale_storage"] = scale_storage
+            if scale_storage == "fp16":
+                config["min_runtime_features"] = ["weight_scale_fp16"]
             config['tokenizer_file'] = 'tokenizer.mtok'
             if self.args.embed_bit < 16:
                 config['embedding_file'] = f"embeddings_int{self.args.embed_bit}.bin"
@@ -1370,7 +1374,7 @@ def build_args(parser):
     parser.add_argument('--group_conv_native', action='store_true', help='Whether or not to keep native group_conv.')
     parser.add_argument('--smooth', action='store_true', help='Whether or not to use smooth quant.')
     parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), default is False.')
-    parser.add_argument('--scale_bit', type=int, default=16, choices=[16, 32], help='Bit-width for quant scale/zero-point storage. Currently supports 16 (fp16, default) and 32 (fp32); 8/4 reserved for future.')
+    parser.add_argument('--scale_bit', type=int, default=32, choices=[16, 32], help='Bit-width for quant scale/zero-point storage. 32 (fp32) is the compatibility default; use 16 (fp16) only with runtimes that support weight_scale_fp16.')
     parser.add_argument('--visual_sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint) for visual model, default is False.')
     parser.add_argument('--seperate_embed', action='store_true', help='For lm and embed shared model, whether or not to sepearte embed to avoid quant, default is False, if True, embed weight will be seperate to embedding bf16.bin.')
     parser.add_argument('--lora_split', action='store_true', help='Whether or not export lora split, default is False.')
