@@ -165,12 +165,16 @@ public:
     size_t getCurrentHistory() const;
     void eraseHistory(size_t begin, size_t end);
     bool setPrefixCacheFile(const std::string& filename, int flag = 0);
+    bool dumpPromptKVCache(const std::vector<int>& input_ids, const std::string& filename);
+    bool loadPromptKVCache(const std::vector<int>& input_ids, const std::string& filename,
+                           std::vector<int>* suffix_ids = nullptr);
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const std::string& user_content, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const ChatMessages& chat_prompts, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(MNN::Express::VARP input_embeds, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     virtual void generate_init(std::ostream* os = nullptr, const char* end_with = nullptr);
     void generate(int max_token);
+    bool continueFromCachedToken(int token, int max_new_tokens = -1);
     std::vector<int> generate(const std::vector<int>& input_ids, int max_new_tokens = -1);
     std::vector<int> generate(MNN::Express::VARP input_embeds, int max_tokens = -1);
     bool stoped();
