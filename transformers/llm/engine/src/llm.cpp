@@ -65,6 +65,95 @@ static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
     return _Const(vec.data(), dims, NHWC, halide_type_of<T>());
 }
 
+static std::string _prefixCacheMetaPath(const std::string& dir, const std::string& name) {
+    return MNNFilePathConcat(dir, name) + ".meta";
+}
+
+static int _countPrefixCacheLayers(const std::string& dir, const std::string& name, int maxLayers) {
+    int layerCount = 0;
+    for (int i = 0; i < maxLayers; i++) {
+        auto base = MNNFilePathConcat(dir, name) + "_" + std::to_string(i);
+        if (!MNNFileExist((base + ".k").c_str()) || !MNNFileExist((base + ".v").c_str()) ||
+            !MNNFileExist((base + "_sync.k").c_str()) || !MNNFileExist((base + "_sync.v").c_str())) {
+            break;
+        }
+        layerCount++;
+    }
+    return layerCount;
+}
+
+struct PrefixCacheMetaInfo {
+    std::vector<int> ids;
+    int firstToken = -1;
+    int layerCount = 0;
+};
+
+static bool _writePrefixCacheMeta(const std::string& path, const PrefixCacheMetaInfo& meta) {
+    std::ofstream ofs(path);
+    if (!ofs.good()) {
+        return false;
+    }
+    ofs << "version 2\n";
+    ofs << "token_count " << meta.ids.size() << "\n";
+    ofs << "first_token " << meta.firstToken << "\n";
+    ofs << "layer_count " << meta.layerCount << "\n";
+    ofs << "tokens";
+    for (auto id : meta.ids) {
+        ofs << " " << id;
+    }
+    ofs << "\n";
+    return ofs.good();
+}
+
+static bool _readPrefixCacheMeta(const std::string& path, PrefixCacheMetaInfo* meta) {
+    std::ifstream ifs(path);
+    if (!ifs.good()) {
+        return false;
+    }
+    std::string key;
+    int version = 0;
+    ifs >> key >> version;
+    if (key != "version" || (version != 1 && version != 2)) {
+        return false;
+    }
+    size_t tokenCount = 0;
+    ifs >> key >> tokenCount;
+    if (key != "token_count") {
+        return false;
+    }
+    int firstToken = -1;
+    if (version >= 2) {
+        ifs >> key >> firstToken;
+        if (key != "first_token") {
+            return false;
+        }
+    }
+    int layerCount = 0;
+    if (version >= 2) {
+        ifs >> key >> layerCount;
+        if (key != "layer_count") {
+            return false;
+        }
+    }
+    ifs >> key;
+    if (key != "tokens") {
+        return false;
+    }
+    std::vector<int> parsed(tokenCount);
+    for (size_t i = 0; i < tokenCount; ++i) {
+        ifs >> parsed[i];
+        if (!ifs.good() && i + 1 < tokenCount) {
+            return false;
+        }
+    }
+    if (meta != nullptr) {
+        meta->ids = std::move(parsed);
+        meta->firstToken = firstToken;
+        meta->layerCount = layerCount;
+    }
+    return true;
+}
+
 // Redefine MNN_PRINT/MNN_ERROR for Llm member methods to capture log into mContext->log_buffer.
 // All code below this point that uses MNN_PRINT/MNN_ERROR must be Llm class member methods.
 #ifdef LLM_LOG_TO_STRING
@@ -1066,6 +1155,48 @@ void Llm::generate(int max_token) {
     mGenerationStrategy->generate(*mGenerateParam);
 }
 
+bool Llm::continueFromCachedToken(int token, int max_new_tokens) {
+    CHECK_LLM_RUNNING_RET(mContext, false);
+    MNN::Express::ExecutorScope s(mExecutor);
+    if (max_new_tokens < 0) {
+        max_new_tokens = mConfig->max_new_tokens();
+    }
+    if (max_new_tokens <= 0) {
+        return true;
+    }
+    mContext->current_token = token;
+    mContext->history_tokens.push_back(token);
+    mContext->output_tokens.push_back(token);
+    updateContext(0, 1);
+    auto decodeStr = tokenizer_decode(token);
+    mContext->generate_str += decodeStr;
+    if (nullptr != mContext->os) {
+        *mContext->os << decodeStr << std::flush;
+    }
+    if (is_stop(token) || max_new_tokens == 1) {
+        if (max_new_tokens == 1 && mContext->status == LlmStatus::RUNNING) {
+            mContext->status = LlmStatus::MAX_TOKENS_FINISHED;
+        }
+        return true;
+    }
+    auto outputs = forwardVec({token});
+    if (outputs.empty()) {
+        return false;
+    }
+    updateContext(1, 0);
+    if (mPrefixCacheMode && mIsPrefixFileExist) {
+        mMeta->previous += mMeta->seqlen_in_disk;
+        mMeta->seqlen_in_disk = 0;
+        mMeta->file_name = "";
+        mMeta->file_flag = KVMeta::NoChange;
+        mMeta->layer_index = 0;
+        mPrefixCacheMode = false;
+    }
+    mGenerateParam->max_new_tokens = max_new_tokens - 1;
+    mGenerationStrategy->generate(*mGenerateParam);
+    return mContext->status != LlmStatus::INTERNAL_ERROR;
+}
+
 std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens) {
     CHECK_LLM_RUNNING_RET(mContext, std::vector<int>());
     MNN::Express::ExecutorScope s(mExecutor);
@@ -1644,6 +1775,132 @@ bool Llm::setPrefixCacheFile(const std::string& filename, int flag) {
     }
 
     return mIsPrefixFileExist;
+}
+
+bool Llm::dumpPromptKVCache(const std::vector<int>& input_ids, const std::string& filename) {
+    CHECK_LLM_RUNNING_RET(mContext, false);
+    if (input_ids.empty()) {
+        MNN_ERROR("dumpPromptKVCache requires non-empty input ids.\n");
+        return false;
+    }
+    if (!mConfig->kvcache_mmap()) {
+        MNN_ERROR("dumpPromptKVCache requires kvcache_mmap=true in config.\n");
+        return false;
+    }
+    if (!mConfig->tmp_path().empty()) {
+        MNNCreateDir(mConfig->tmp_path().c_str());
+    }
+    MNNCreateDir(mConfig->prefix_cache_path().c_str());
+    if (!setPrefixCacheFile(filename)) {
+        MNN_PRINT("Dumping new prefix KV cache: %s\n", filename.c_str());
+    } else {
+        MNN_PRINT("Prefix KV cache already exists, overwriting metadata only: %s\n", filename.c_str());
+    }
+    // Force write mode even if setPrefixCacheFile found an existing valid cache.
+    mIsPrefixFileExist = false;
+    mPrefixCacheMode = true;
+    mCallIndex = 0;
+    mContext->os = nullptr;
+    generate_init(nullptr, "\n");
+    generate(input_ids, 0);
+    if (mGenerateParam->outputs.empty()) {
+        MNN_ERROR("Failed to dump prefix KV cache: no logits after prefill.\n");
+        return false;
+    }
+    int firstToken = sample(mGenerateParam->outputs[0], mGenerateParam->validLogitStart, mGenerateParam->validLogitSize);
+    completePrefixWrite();
+    auto metaPath = _prefixCacheMetaPath(mConfig->prefix_cache_path(), filename);
+    PrefixCacheMetaInfo meta;
+    meta.ids = input_ids;
+    meta.firstToken = firstToken;
+    meta.layerCount = _countPrefixCacheLayers(mConfig->prefix_cache_path(), filename, mConfig->layer_nums());
+    if (meta.layerCount <= 0) {
+        MNN_ERROR("Failed to dump prefix KV cache: no layer files were written.\n");
+        return false;
+    }
+    if (!_writePrefixCacheMeta(metaPath, meta)) {
+        MNN_ERROR("Failed to write prefix KV metadata: %s\n", metaPath.c_str());
+        return false;
+    }
+    MNN_PRINT("Dumped prefix KV cache %s with %zu cached tokens, %d layers, first token %d.\n",
+              filename.c_str(), input_ids.size(), meta.layerCount, firstToken);
+    return mContext->status != LlmStatus::INTERNAL_ERROR;
+}
+
+bool Llm::loadPromptKVCache(const std::vector<int>& input_ids, const std::string& filename,
+                            std::vector<int>* suffix_ids) {
+    CHECK_LLM_RUNNING_RET(mContext, false);
+    if (input_ids.empty()) {
+        MNN_ERROR("loadPromptKVCache requires non-empty input ids.\n");
+        return false;
+    }
+    if (!mConfig->kvcache_mmap()) {
+        MNN_ERROR("loadPromptKVCache requires kvcache_mmap=true in config.\n");
+        return false;
+    }
+    if (!mConfig->tmp_path().empty()) {
+        MNNCreateDir(mConfig->tmp_path().c_str());
+    }
+    MNNCreateDir(mConfig->prefix_cache_path().c_str());
+    PrefixCacheMetaInfo metaInfo;
+    auto metaPath = _prefixCacheMetaPath(mConfig->prefix_cache_path(), filename);
+    if (!_readPrefixCacheMeta(metaPath, &metaInfo)) {
+        MNN_ERROR("Failed to read prefix KV metadata: %s\n", metaPath.c_str());
+        return false;
+    }
+    const auto& cachedIds = metaInfo.ids;
+    if (cachedIds.empty()) {
+        MNN_ERROR("Prefix KV metadata has empty token list: %s\n", metaPath.c_str());
+        return false;
+    }
+    if (input_ids != cachedIds) {
+        MNN_ERROR("Prompt tokens do not match cached prompt: %s\n", filename.c_str());
+        return false;
+    }
+    if (metaInfo.firstToken < 0) {
+        MNN_ERROR("Prefix KV metadata has no cached first token; please re-dump cache: %s\n", filename.c_str());
+        return false;
+    }
+    int maxLayerCheck = metaInfo.layerCount > 0 ? metaInfo.layerCount : mConfig->layer_nums();
+    int cachedLayerCount = _countPrefixCacheLayers(mConfig->prefix_cache_path(), filename, maxLayerCheck);
+    if (cachedLayerCount <= 0) {
+        MNN_ERROR("Prefix KV cache files are missing or invalid: %s\n", filename.c_str());
+        return false;
+    }
+    if (metaInfo.layerCount > 0 && cachedLayerCount != metaInfo.layerCount) {
+        MNN_ERROR("Prefix KV cache layer count mismatch: metadata=%d files=%d\n", metaInfo.layerCount,
+                  cachedLayerCount);
+        return false;
+    }
+    if (cachedLayerCount != mConfig->layer_nums()) {
+        MNN_PRINT("Prefix KV cache has %d layers; config layer_nums=%d. Loading cache layer count.\n",
+                  cachedLayerCount, mConfig->layer_nums());
+    }
+    mMeta->layer_nums = cachedLayerCount;
+
+    std::vector<int> suffix;
+    suffix.assign(input_ids.begin() + cachedIds.size(), input_ids.end());
+    if (suffix_ids != nullptr) {
+        *suffix_ids = suffix;
+    }
+
+    mPrefixCacheFileName = filename;
+    mPrefixCacheMode = true;
+    mCallIndex = 1; // Next generate() enters the PendingRead branch.
+    mIsPrefixFileExist = true;
+    mPrefixLength = (int)cachedIds.size();
+    mMeta->file_name = mPrefixCacheFileName;
+    mMeta->file_flag = KVMeta::PendingRead;
+    mMeta->seqlen_in_disk = mPrefixLength;
+    mMeta->layer_index = 0;
+    mMeta->previous = 0;
+    mMeta->remove = 0;
+    mContext->all_seq_len = mPrefixLength;
+    mContext->history_tokens.assign(input_ids.begin(), input_ids.begin() + mPrefixLength);
+    mContext->current_token = metaInfo.firstToken;
+    MNN_PRINT("Loaded prefix KV cache %s with %d cached tokens, suffix tokens %zu, first token %d.\n",
+              filename.c_str(), mPrefixLength, suffix.size(), metaInfo.firstToken);
+    return true;
 }
 
 void Llm::completePrefixWrite() {
