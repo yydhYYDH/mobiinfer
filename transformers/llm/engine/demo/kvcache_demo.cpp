@@ -81,6 +81,89 @@ static int load_kvcache(Llm* llm, const std::string& cache_name, const std::stri
     return 0;
 }
 
+static int load_prefix_step(Llm* llm, const std::string& cache_name, const std::string& prefix_file,
+                            const std::string& variable_file, int max_token_number) {
+    auto prefix = read_prompt_file(prefix_file);
+    if (prefix.empty()) {
+        MNN_ERROR("Prefix file is empty: %s\n", prefix_file.c_str());
+        return 1;
+    }
+    auto variable = read_prompt_file(variable_file);
+    if (variable.empty()) {
+        MNN_ERROR("Variable file is empty: %s\n", variable_file.c_str());
+        return 1;
+    }
+    auto prefix_ids = encode_raw_prompt(llm, prefix);
+    auto variable_ids = encode_raw_prompt(llm, variable);
+    if (prefix_ids.empty() || variable_ids.empty()) {
+        MNN_ERROR("Prefix or variable encodes to empty token list.\n");
+        return 1;
+    }
+
+    std::ostringstream answer;
+    llm->generate_init(&answer, "\n");
+    if (!llm->loadPromptKVCachePrefixOnly(prefix_ids, cache_name)) {
+        MNN_ERROR("Failed to load prefix-only KV cache: %s\n", cache_name.c_str());
+        return 1;
+    }
+    llm->generate(variable_ids, max_token_number);
+    auto context = llm->getContext();
+    if (context->status == LlmStatus::INTERNAL_ERROR) {
+        MNN_ERROR("Error: Generation failed due to internal error\n");
+        return 1;
+    }
+
+    MNN_PRINT("%s", answer.str().c_str());
+    MNN_PRINT("\n#################################\n");
+    MNN_PRINT("cached prefix tokens num = %d\n", (int)prefix_ids.size());
+    MNN_PRINT("variable tokens num = %d\n", (int)variable_ids.size());
+    MNN_PRINT("decode tokens num = %d\n", context->gen_seq_len);
+    MNN_PRINT("prefill time = %.2f s\n", context->prefill_us / 1e6);
+    MNN_PRINT("decode time = %.2f s\n", context->decode_us / 1e6);
+    MNN_PRINT("##################################\n");
+    return 0;
+}
+
+static int split_step(Llm* llm, const std::string& prefix_file, const std::string& variable_file,
+                      int max_token_number) {
+    auto prefix = read_prompt_file(prefix_file);
+    if (prefix.empty()) {
+        MNN_ERROR("Prefix file is empty: %s\n", prefix_file.c_str());
+        return 1;
+    }
+    auto variable = read_prompt_file(variable_file);
+    if (variable.empty()) {
+        MNN_ERROR("Variable file is empty: %s\n", variable_file.c_str());
+        return 1;
+    }
+    auto prefix_ids = encode_raw_prompt(llm, prefix);
+    auto variable_ids = encode_raw_prompt(llm, variable);
+    if (prefix_ids.empty() || variable_ids.empty()) {
+        MNN_ERROR("Prefix or variable encodes to empty token list.\n");
+        return 1;
+    }
+
+    std::ostringstream answer;
+    llm->generate_init(&answer, "\n");
+    llm->generate(prefix_ids, 0);
+    llm->generate(variable_ids, max_token_number);
+    auto context = llm->getContext();
+    if (context->status == LlmStatus::INTERNAL_ERROR) {
+        MNN_ERROR("Error: Generation failed due to internal error\n");
+        return 1;
+    }
+
+    MNN_PRINT("%s", answer.str().c_str());
+    MNN_PRINT("\n#################################\n");
+    MNN_PRINT("split prefix tokens num = %d\n", (int)prefix_ids.size());
+    MNN_PRINT("variable tokens num = %d\n", (int)variable_ids.size());
+    MNN_PRINT("decode tokens num = %d\n", context->gen_seq_len);
+    MNN_PRINT("prefill time = %.2f s\n", context->prefill_us / 1e6);
+    MNN_PRINT("decode time = %.2f s\n", context->decode_us / 1e6);
+    MNN_PRINT("##################################\n");
+    return 0;
+}
+
 static int raw_generate(Llm* llm, const std::string& prompt_file, int max_token_number) {
     auto prompt = read_prompt_file(prompt_file);
     if (prompt.empty()) {
@@ -120,6 +203,8 @@ static void print_usage(const char* name) {
     MNN_PRINT("  %s config.json --raw prompt.txt [max_tokens]\n", name);
     MNN_PRINT("  %s config.json --dump <cache_name> prompt.txt\n", name);
     MNN_PRINT("  %s config.json --load <cache_name> prompt.txt [max_tokens]\n", name);
+    MNN_PRINT("  %s config.json --split-step prefix.txt variable.txt [max_tokens]\n", name);
+    MNN_PRINT("  %s config.json --load-prefix-step <cache_name> prefix.txt variable.txt [max_tokens]\n", name);
 }
 
 int main(int argc, const char* argv[]) {
@@ -178,6 +263,35 @@ int main(int argc, const char* argv[]) {
             os >> max_token_number;
         }
         return raw_generate(llm.get(), prompt_file, max_token_number);
+    }
+    if (mode == "--load-prefix-step") {
+        if (argc < 6) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        std::string cache_name = argv[3];
+        std::string prefix_file = argv[4];
+        std::string variable_file = argv[5];
+        int max_token_number = -1;
+        if (argc >= 7) {
+            std::istringstream os(argv[6]);
+            os >> max_token_number;
+        }
+        return load_prefix_step(llm.get(), cache_name, prefix_file, variable_file, max_token_number);
+    }
+    if (mode == "--split-step") {
+        if (argc < 5) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        std::string prefix_file = argv[3];
+        std::string variable_file = argv[4];
+        int max_token_number = -1;
+        if (argc >= 6) {
+            std::istringstream os(argv[5]);
+            os >> max_token_number;
+        }
+        return split_step(llm.get(), prefix_file, variable_file, max_token_number);
     }
 
     print_usage(argv[0]);
