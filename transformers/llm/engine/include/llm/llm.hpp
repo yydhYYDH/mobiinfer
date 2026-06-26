@@ -168,6 +168,7 @@ public:
     bool dumpPromptKVCache(const std::vector<int>& input_ids, const std::string& filename);
     bool loadPromptKVCache(const std::vector<int>& input_ids, const std::string& filename,
                            std::vector<int>* suffix_ids = nullptr);
+    bool loadPromptKVCachePrefixOnly(const std::vector<int>& input_ids, const std::string& filename);
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const std::string& user_content, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
     void response(const ChatMessages& chat_prompts, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1);
