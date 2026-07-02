@@ -495,7 +495,21 @@ transformers/llm/export/onnx_omc2_resnet50_route_v1/
 transformers/llm/export/plugin_quant.md
 transformers/llm/export/plugin_quant_visual_gemm_route_v1/
 transformers/llm/export/plugin_quant_visual_matmul_all_blocks_route_v1/
-transformers/llm/export/plugin_quant_visual_matmul_route_v1/
+# transformers/llm/export/plugin_quant_visual_matmul_route_v1/
 transformers/llm/export/plugin_quant_visual_route_v1/
 transformers/llm/export/pytorch_visual_omc6_route_v1/
 transformers/llm/export/discarded_omg_convert/
+
+
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.pth
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.onnx
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.onnx.pb
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.pb
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.om
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.omc
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/**/*.npz
+.playwright-mcp/
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/__pycache__
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/.claude
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/.empty
+transformers/llm/export/plugin_quant_visual_matmul_route_v1/model*
