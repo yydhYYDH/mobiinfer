@@ -191,7 +191,7 @@ cd "${SCRIPT_DIR}"
 
 FAILED_CHUNKS=()
 for i in 0 1 2 3 4 5; do
-    ROUTE_DIR="${OMC_OUT_ROOT}/model_visual_plugin_matmul_chunk${i}_${ROUTE_SUFFIX}"
+    ROUTE_DIR="${OMC_OUT_ROOT}/model_visual_plugin_matmul_chunk_W8A8_${i}_${ROUTE_SUFFIX}"
     ONNX_FILE="${ROUTE_DIR}/onnx/visual_blocks_npu_${i}.onnx"
     OM_FILE="${ROUTE_DIR}/omc_output/visual_plugin_matmul_quantized.om"
     OMC_LOG="${ROUTE_DIR}/omc_output/omc_${PLATFORM}.log"
@@ -216,7 +216,7 @@ for i in 0 1 2 3 4 5; do
         --quant_strategy Quant_aigc_ptq \
         --weight_bit 8 \
         --weight_algo min_max \
-        --act_bit 16 \
+        --act_bit 8 \
         --input_algo min_max \
         --num_samples ${NUM_IMAGES} \
         --group_size 128 \
@@ -254,7 +254,7 @@ echo "  pipeline finished"
 echo "=========================================="
 ALL_OK=1
 for i in 0 1 2 3 4 5; do
-    OM_FILE="${OMC_OUT_ROOT}/model_visual_plugin_matmul_chunk${i}_${ROUTE_SUFFIX}/omc_output/visual_plugin_matmul_quantized.om"
+    OM_FILE="${OMC_OUT_ROOT}/model_visual_plugin_matmul_chunk_W8A8_${i}_${ROUTE_SUFFIX}/omc_output/visual_plugin_matmul_quantized.om"
     if [ -f "${OM_FILE}" ]; then
         SIZE=$(ls -lh "${OM_FILE}" 2>/dev/null | awk '{print $5}')
         echo "  [OK]   chunk ${i}: ${OM_FILE}  (${SIZE})"
