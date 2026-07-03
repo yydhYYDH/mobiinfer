@@ -11,6 +11,9 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
 
 #include "prompt_cache_utils.hpp"
 #include <MNN/AutoTime.hpp>
@@ -86,6 +89,8 @@ struct PrefixCacheMetaInfo {
     std::vector<int> ids;
     int firstToken = -1;
     int layerCount = 0;
+    std::vector<size_t> keySizes;
+    std::vector<size_t> valueSizes;
 };
 
 static bool _writePrefixCacheMeta(const std::string& path, const PrefixCacheMetaInfo& meta) {
@@ -93,10 +98,17 @@ static bool _writePrefixCacheMeta(const std::string& path, const PrefixCacheMeta
     if (!ofs.good()) {
         return false;
     }
-    ofs << "version 2\n";
+    ofs << "version 3\n";
     ofs << "token_count " << meta.ids.size() << "\n";
     ofs << "first_token " << meta.firstToken << "\n";
     ofs << "layer_count " << meta.layerCount << "\n";
+    if (!meta.keySizes.empty() && meta.keySizes.size() == meta.valueSizes.size()) {
+        ofs << "layer_sizes";
+        for (size_t i = 0; i < meta.keySizes.size(); i++) {
+            ofs << " " << meta.keySizes[i] << ":" << meta.valueSizes[i];
+        }
+        ofs << "\n";
+    }
     ofs << "tokens";
     for (auto id : meta.ids) {
         ofs << " " << id;
@@ -113,7 +125,7 @@ static bool _readPrefixCacheMeta(const std::string& path, PrefixCacheMetaInfo* m
     std::string key;
     int version = 0;
     ifs >> key >> version;
-    if (key != "version" || (version != 1 && version != 2)) {
+    if (key != "version" || (version < 1 || version > 3)) {
         return false;
     }
     size_t tokenCount = 0;
@@ -135,6 +147,31 @@ static bool _readPrefixCacheMeta(const std::string& path, PrefixCacheMetaInfo* m
             return false;
         }
     }
+    std::vector<size_t> keySizes;
+    std::vector<size_t> valueSizes;
+    if (version >= 3) {
+        ifs >> key;
+        if (key != "layer_sizes") {
+            return false;
+        }
+        keySizes.reserve(layerCount);
+        valueSizes.reserve(layerCount);
+        for (int i = 0; i < layerCount; i++) {
+            std::string pair;
+            ifs >> pair;
+            auto sep = pair.find(':');
+            if (sep == std::string::npos) {
+                return false;
+            }
+            size_t kSize = static_cast<size_t>(std::strtoull(pair.substr(0, sep).c_str(), nullptr, 10));
+            size_t vSize = static_cast<size_t>(std::strtoull(pair.substr(sep + 1).c_str(), nullptr, 10));
+            if (kSize == 0 || vSize == 0) {
+                return false;
+            }
+            keySizes.push_back(kSize);
+            valueSizes.push_back(vSize);
+        }
+    }
     ifs >> key;
     if (key != "tokens") {
         return false;
@@ -150,6 +187,8 @@ static bool _readPrefixCacheMeta(const std::string& path, PrefixCacheMetaInfo* m
         meta->ids = std::move(parsed);
         meta->firstToken = firstToken;
         meta->layerCount = layerCount;
+        meta->keySizes = std::move(keySizes);
+        meta->valueSizes = std::move(valueSizes);
     }
     return true;
 }
@@ -158,6 +197,56 @@ struct PrefixCacheLoadInfo {
     PrefixCacheMetaInfo meta;
     int layerCount = 0;
 };
+
+static double _elapsedMs(std::chrono::steady_clock::time_point start) {
+    auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static size_t _fileSizeIfExists(const std::string& path) {
+    if (!MNNFileExist(path.c_str())) {
+        return 0;
+    }
+    auto fd = MNNOpenFile(path.c_str(), MNN_FILE_READ);
+    if (fd == INVALID_FILE) {
+        return 0;
+    }
+    size_t size = MNNGetFileSize(fd);
+    MNNCloseFile(fd);
+    return size;
+}
+
+static size_t _prefixCacheBytes(const std::string& prefixCachePath, const std::string& filename, int layerCount) {
+    size_t total = _fileSizeIfExists(_prefixCacheMetaPath(prefixCachePath, filename));
+    for (int i = 0; i < layerCount; i++) {
+        auto base = MNNFilePathConcat(prefixCachePath, filename) + "_" + std::to_string(i);
+        total += _fileSizeIfExists(base + ".k");
+        total += _fileSizeIfExists(base + ".v");
+    }
+    return total;
+}
+
+static bool _prefixCacheLayerSizes(const std::string& prefixCachePath, const std::string& filename, int layerCount,
+                                   std::vector<size_t>* keySizes, std::vector<size_t>* valueSizes) {
+    if (keySizes == nullptr || valueSizes == nullptr || layerCount <= 0) {
+        return false;
+    }
+    keySizes->clear();
+    valueSizes->clear();
+    keySizes->reserve(layerCount);
+    valueSizes->reserve(layerCount);
+    for (int i = 0; i < layerCount; i++) {
+        auto base = MNNFilePathConcat(prefixCachePath, filename) + "_" + std::to_string(i);
+        size_t kSize = _fileSizeIfExists(base + ".k");
+        size_t vSize = _fileSizeIfExists(base + ".v");
+        if (kSize == 0 || vSize == 0) {
+            return false;
+        }
+        keySizes->push_back(kSize);
+        valueSizes->push_back(vSize);
+    }
+    return true;
+}
 
 // Redefine MNN_PRINT/MNN_ERROR for Llm member methods to capture log into mContext->log_buffer.
 // All code below this point that uses MNN_PRINT/MNN_ERROR must be Llm class member methods.
@@ -1089,9 +1178,8 @@ void Llm::reset() {
 void Llm::generate_init(std::ostream* os, const char* end_with) {
     // init status
     mContext->os = os;
-    if (nullptr != end_with) {
-        mContext->end_with = end_with;
-    }
+    (void)end_with;
+    mContext->end_with = "\n";
     if (!mContext->generate_str.empty()) {
         mContext->generate_str.clear();
     }
@@ -1784,6 +1872,8 @@ bool Llm::setPrefixCacheFile(const std::string& filename, int flag) {
 
 bool Llm::dumpPromptKVCache(const std::vector<int>& input_ids, const std::string& filename) {
     CHECK_LLM_RUNNING_RET(mContext, false);
+    auto totalStart = std::chrono::steady_clock::now();
+    MNN_PRINT("dumpPromptKVCache begin cache=%s tokens=%zu\n", filename.c_str(), input_ids.size());
     if (input_ids.empty()) {
         MNN_ERROR("dumpPromptKVCache requires non-empty input ids.\n");
         return false;
@@ -1796,40 +1886,106 @@ bool Llm::dumpPromptKVCache(const std::vector<int>& input_ids, const std::string
         MNNCreateDir(mConfig->tmp_path().c_str());
     }
     MNNCreateDir(mConfig->prefix_cache_path().c_str());
+    auto t0 = std::chrono::steady_clock::now();
     if (!setPrefixCacheFile(filename)) {
         MNN_PRINT("Dumping new prefix KV cache: %s\n", filename.c_str());
     } else {
         MNN_PRINT("Prefix KV cache already exists, overwriting metadata only: %s\n", filename.c_str());
     }
+    double setPrefixMs = _elapsedMs(t0);
+    MNN_PRINT("dumpPromptKVCache setPrefixCacheFile done cache=%s elapsed_ms=%.3f\n",
+              filename.c_str(), setPrefixMs);
     // Force write mode even if setPrefixCacheFile found an existing valid cache.
     mIsPrefixFileExist = false;
     mPrefixCacheMode = true;
-    mCallIndex = 0;
+    mCallIndex = 1;
+    mPrefixLength = (int)input_ids.size();
+    mMeta->file_name = mPrefixCacheFileName;
+    mMeta->file_flag = KVMeta::PendingWrite;
+    mMeta->layer_index = 0;
     mContext->os = nullptr;
+    t0 = std::chrono::steady_clock::now();
     generate_init(nullptr, "\n");
-    generate(input_ids, 0);
+    double initMs = _elapsedMs(t0);
+    MNN_PRINT("dumpPromptKVCache generate_init done cache=%s elapsed_ms=%.3f\n", filename.c_str(), initMs);
+    t0 = std::chrono::steady_clock::now();
+    auto inputEmbeds = embedding(input_ids);
+    if (inputEmbeds == nullptr) {
+        MNN_ERROR("Failed to dump prefix KV cache: embedding returned null.\n");
+        return false;
+    }
+    generate(inputEmbeds, 0);
+    double prefillMs = _elapsedMs(t0);
+    MNN_PRINT("dumpPromptKVCache prefill done cache=%s elapsed_ms=%.3f status=%d prompt_len=%d\n",
+              filename.c_str(), prefillMs, static_cast<int>(mContext->status), mContext->prompt_len);
     if (mGenerateParam->outputs.empty()) {
         MNN_ERROR("Failed to dump prefix KV cache: no logits after prefill.\n");
         return false;
     }
+    t0 = std::chrono::steady_clock::now();
     int firstToken = sample(mGenerateParam->outputs[0], mGenerateParam->validLogitStart, mGenerateParam->validLogitSize);
+    double sampleMs = _elapsedMs(t0);
+    MNN_PRINT("dumpPromptKVCache sample first token done cache=%s first_token=%d elapsed_ms=%.3f\n",
+              filename.c_str(), firstToken, sampleMs);
+    t0 = std::chrono::steady_clock::now();
     completePrefixWrite();
+    double completeMs = _elapsedMs(t0);
+    MNN_PRINT("dumpPromptKVCache completePrefixWrite done cache=%s elapsed_ms=%.3f\n",
+              filename.c_str(), completeMs);
     auto metaPath = _prefixCacheMetaPath(mConfig->prefix_cache_path(), filename);
     PrefixCacheMetaInfo meta;
     meta.ids = input_ids;
     meta.firstToken = firstToken;
+    t0 = std::chrono::steady_clock::now();
     meta.layerCount = _countPrefixCacheLayers(mConfig->prefix_cache_path(), filename, mConfig->layer_nums());
+    double countLayerMs = _elapsedMs(t0);
+    MNN_PRINT("dumpPromptKVCache count layers done cache=%s layers=%d elapsed_ms=%.3f\n",
+              filename.c_str(), meta.layerCount, countLayerMs);
     if (meta.layerCount <= 0) {
         MNN_ERROR("Failed to dump prefix KV cache: no layer files were written.\n");
         return false;
     }
+    if (!_prefixCacheLayerSizes(mConfig->prefix_cache_path(), filename, meta.layerCount,
+                                &meta.keySizes, &meta.valueSizes)) {
+        MNN_ERROR("Failed to collect prefix KV layer sizes: %s\n", filename.c_str());
+        return false;
+    }
+    if (!meta.keySizes.empty()) {
+        MNN_PRINT("dumpPromptKVCache layer0 sizes cache=%s k=%zu v=%zu cached_tokens=%zu\n",
+                  filename.c_str(), meta.keySizes[0], meta.valueSizes[0], input_ids.size());
+    }
+    t0 = std::chrono::steady_clock::now();
     if (!_writePrefixCacheMeta(metaPath, meta)) {
         MNN_ERROR("Failed to write prefix KV metadata: %s\n", metaPath.c_str());
         return false;
     }
-    MNN_PRINT("Dumped prefix KV cache %s with %zu cached tokens, %d layers, first token %d.\n",
-              filename.c_str(), input_ids.size(), meta.layerCount, firstToken);
+    double writeMetaMs = _elapsedMs(t0);
+    size_t cacheBytes = _prefixCacheBytes(mConfig->prefix_cache_path(), filename, meta.layerCount);
+    double totalMs = _elapsedMs(totalStart);
+    double effectiveGbps = totalMs > 0.0 ? static_cast<double>(cacheBytes) / (totalMs / 1000.0) / 1.0e9 : 0.0;
+    MNN_PRINT("dumpPromptKVCache write metadata done cache=%s elapsed_ms=%.3f\n",
+              filename.c_str(), writeMetaMs);
+    MNN_PRINT("Dumped prefix KV cache %s with %zu cached tokens, %d layers, first token %d. total_ms=%.3f cache_bytes=%zu cache_mb=%.3f effective_write_gbps=%.3f\n",
+              filename.c_str(), input_ids.size(), meta.layerCount, firstToken, totalMs, cacheBytes,
+              static_cast<double>(cacheBytes) / (1024.0 * 1024.0), effectiveGbps);
     return mContext->status != LlmStatus::INTERNAL_ERROR;
+}
+
+int Llm::countPromptTokensFromText(const char* prompt) {
+    if (prompt == nullptr) {
+        return -1;
+    }
+    auto ids = tokenizer_encode(std::string(prompt));
+    return static_cast<int>(ids.size());
+}
+
+bool Llm::dumpPromptKVCacheFromText(const char* prompt, const char* filename) {
+    if (prompt == nullptr || filename == nullptr) {
+        MNN_ERROR("dumpPromptKVCacheFromText requires non-null prompt and filename.\n");
+        return false;
+    }
+    auto ids = tokenizer_encode(std::string(prompt));
+    return dumpPromptKVCache(ids, std::string(filename));
 }
 
 static bool _preparePrefixCacheLoad(const std::shared_ptr<LlmConfig>& config, KVMeta* meta,
@@ -1876,6 +2032,28 @@ static bool _preparePrefixCacheLoad(const std::shared_ptr<LlmConfig>& config, KV
         MNN_ERROR("Prefix KV cache layer count mismatch: metadata=%d files=%d\n", metaInfo.layerCount,
                   cachedLayerCount);
         return false;
+    }
+    if (!metaInfo.keySizes.empty() || !metaInfo.valueSizes.empty()) {
+        if ((int)metaInfo.keySizes.size() != cachedLayerCount || (int)metaInfo.valueSizes.size() != cachedLayerCount) {
+            MNN_ERROR("Prefix KV cache layer size metadata mismatch: key_sizes=%zu value_sizes=%zu files=%d\n",
+                      metaInfo.keySizes.size(), metaInfo.valueSizes.size(), cachedLayerCount);
+            return false;
+        }
+        std::vector<size_t> currentKeySizes;
+        std::vector<size_t> currentValueSizes;
+        if (!_prefixCacheLayerSizes(config->prefix_cache_path(), filename, cachedLayerCount,
+                                    &currentKeySizes, &currentValueSizes)) {
+            MNN_ERROR("Prefix KV cache failed to collect current layer sizes: %s\n", filename.c_str());
+            return false;
+        }
+        for (int i = 0; i < cachedLayerCount; i++) {
+            if (currentKeySizes[i] != metaInfo.keySizes[i] || currentValueSizes[i] != metaInfo.valueSizes[i]) {
+                MNN_ERROR("Prefix KV cache layer size changed at layer %d: current k=%zu v=%zu metadata k=%zu v=%zu cache=%s\n",
+                          i, currentKeySizes[i], currentValueSizes[i], metaInfo.keySizes[i], metaInfo.valueSizes[i],
+                          filename.c_str());
+                return false;
+            }
+        }
     }
     if (cachedLayerCount != config->layer_nums()) {
         MNN_PRINT("Prefix KV cache has %d layers; config layer_nums=%d. Loading cache layer count.\n",
@@ -1946,6 +2124,113 @@ bool Llm::loadPromptKVCachePrefixOnly(const std::vector<int>& input_ids, const s
     mContext->current_token = -1;
     MNN_PRINT("Loaded prefix-only KV cache %s with %d cached tokens.\n", filename.c_str(), mPrefixLength);
     return true;
+}
+
+bool Llm::loadPromptKVCachePrefixOnlyFromText(const char* prompt, const char* filename) {
+    if (prompt == nullptr || filename == nullptr) {
+        MNN_ERROR("loadPromptKVCachePrefixOnlyFromText requires non-null prompt and filename.\n");
+        return false;
+    }
+    auto ids = tokenizer_encode(std::string(prompt));
+    return loadPromptKVCachePrefixOnly(ids, std::string(filename));
+}
+
+bool Llm::prefillAfterPromptKVCachePrefixOnlyFromText(const char* prefix, const char* filename,
+                                                      const char* suffix) {
+    if (prefix == nullptr || filename == nullptr || suffix == nullptr) {
+        MNN_ERROR("prefillAfterPromptKVCachePrefixOnlyFromText requires non-null prefix, filename and suffix.\n");
+        return false;
+    }
+    auto totalStart = std::chrono::steady_clock::now();
+    std::string cacheName(filename);
+    MNN_PRINT("prefillAfterPromptKVCachePrefixOnlyFromText begin cache=%s prefix_chars=%zu suffix_chars=%zu\n",
+              filename, strlen(prefix), strlen(suffix));
+    auto t0 = std::chrono::steady_clock::now();
+    auto prefixIds = tokenizer_encode(std::string(prefix));
+    double encodePrefixMs = _elapsedMs(t0);
+    t0 = std::chrono::steady_clock::now();
+    auto suffixIds = tokenizer_encode(std::string(suffix));
+    double encodeSuffixMs = _elapsedMs(t0);
+    MNN_PRINT("prefillAfterPromptKVCachePrefixOnlyFromText encode done prefix_tokens=%zu suffix_tokens=%zu prefix_ms=%.3f suffix_ms=%.3f\n",
+              prefixIds.size(), suffixIds.size(), encodePrefixMs, encodeSuffixMs);
+    if (prefixIds.empty() || suffixIds.empty()) {
+        MNN_ERROR("prefillAfterPromptKVCachePrefixOnlyFromText requires non-empty prefix and suffix tokens.\n");
+        return false;
+    }
+    t0 = std::chrono::steady_clock::now();
+    generate_init(nullptr, "\n");
+    double initMs = _elapsedMs(t0);
+    t0 = std::chrono::steady_clock::now();
+    if (!loadPromptKVCachePrefixOnly(prefixIds, cacheName)) {
+        MNN_ERROR("prefillAfterPromptKVCachePrefixOnlyFromText load prefix failed cache=%s elapsed_ms=%.3f\n",
+                  cacheName.c_str(), _elapsedMs(t0));
+        return false;
+    }
+    double loadMs = _elapsedMs(t0);
+    size_t cacheBytes = _prefixCacheBytes(mConfig->prefix_cache_path(), cacheName, mPrefixLength > 0 ? mConfig->layer_nums() : 0);
+    double loadGbps = loadMs > 0.0 ? static_cast<double>(cacheBytes) / (loadMs / 1000.0) / 1.0e9 : 0.0;
+    t0 = std::chrono::steady_clock::now();
+    generate(suffixIds, 0);
+    double prefillMs = _elapsedMs(t0);
+    bool ok = mContext->status != LlmStatus::INTERNAL_ERROR;
+    MNN_PRINT("prefillAfterPromptKVCachePrefixOnlyFromText done ok=%d cache=%s cached_tokens=%d suffix_tokens=%zu history=%zu init_ms=%.3f load_ms=%.3f prefill_ms=%.3f total_ms=%.3f cache_bytes=%zu load_gbps=%.3f\n",
+              ok ? 1 : 0, cacheName.c_str(), mPrefixLength, suffixIds.size(), getCurrentHistory(),
+              initMs, loadMs, prefillMs, _elapsedMs(totalStart), cacheBytes, loadGbps);
+    return ok;
+}
+
+bool Llm::decodeAfterPromptKVCachePrefixOnlyFromText(const char* prefix, const char* filename,
+                                                     const char* variable, int max_new_tokens,
+                                                     std::ostream* os) {
+    if (prefix == nullptr || filename == nullptr || variable == nullptr) {
+        MNN_ERROR("decodeAfterPromptKVCachePrefixOnlyFromText requires non-null prefix, filename and variable.\n");
+        return false;
+    }
+    auto totalStart = std::chrono::steady_clock::now();
+    std::string cacheName(filename);
+    MNN_PRINT("decodeAfterPromptKVCachePrefixOnlyFromText begin cache=%s prefix_chars=%zu variable_chars=%zu max_new_tokens=%d\n",
+              filename, strlen(prefix), strlen(variable), max_new_tokens);
+    auto t0 = std::chrono::steady_clock::now();
+    auto prefixIds = tokenizer_encode(std::string(prefix));
+    double encodePrefixMs = _elapsedMs(t0);
+    MNN_PRINT("decodeAfterPromptKVCachePrefixOnlyFromText encode prefix done tokens=%zu elapsed_ms=%.3f\n",
+              prefixIds.size(), encodePrefixMs);
+    t0 = std::chrono::steady_clock::now();
+    auto variableIds = tokenizer_encode(std::string(variable));
+    double encodeVariableMs = _elapsedMs(t0);
+    MNN_PRINT("decodeAfterPromptKVCachePrefixOnlyFromText encode variable done tokens=%zu elapsed_ms=%.3f\n",
+              variableIds.size(), encodeVariableMs);
+    if (prefixIds.empty() || variableIds.empty()) {
+        MNN_ERROR("decodeAfterPromptKVCachePrefixOnlyFromText requires non-empty prefix and variable tokens.\n");
+        return false;
+    }
+    if (max_new_tokens == 0) {
+        max_new_tokens = 1;
+    }
+    t0 = std::chrono::steady_clock::now();
+    generate_init(os, "\n");
+    double initMs = _elapsedMs(t0);
+    MNN_PRINT("decodeAfterPromptKVCachePrefixOnlyFromText generate_init done elapsed_ms=%.3f\n", initMs);
+    t0 = std::chrono::steady_clock::now();
+    if (!loadPromptKVCachePrefixOnly(prefixIds, cacheName)) {
+        MNN_ERROR("decodeAfterPromptKVCachePrefixOnlyFromText load prefix failed cache=%s elapsed_ms=%.3f\n",
+                  cacheName.c_str(), _elapsedMs(t0));
+        return false;
+    }
+    double loadMs = _elapsedMs(t0);
+    size_t cacheBytes = _prefixCacheBytes(mConfig->prefix_cache_path(), cacheName, mPrefixLength > 0 ? mConfig->layer_nums() : 0);
+    double loadGbps = loadMs > 0.0 ? static_cast<double>(cacheBytes) / (loadMs / 1000.0) / 1.0e9 : 0.0;
+    MNN_PRINT("decodeAfterPromptKVCachePrefixOnlyFromText load prefix done cache=%s cached_tokens=%d cache_bytes=%zu cache_mb=%.3f load_prefix_ms=%.3f effective_gbps=%.3f\n",
+              cacheName.c_str(), mPrefixLength, cacheBytes, static_cast<double>(cacheBytes) / (1024.0 * 1024.0),
+              loadMs, loadGbps);
+    t0 = std::chrono::steady_clock::now();
+    generate(variableIds, max_new_tokens);
+    double generateMs = _elapsedMs(t0);
+    bool ok = mContext->status != LlmStatus::INTERNAL_ERROR;
+    MNN_PRINT("decodeAfterPromptKVCachePrefixOnlyFromText generate variable done ok=%d status=%d generated_tokens=%d generate_ms=%.3f total_ms=%.3f\n",
+              ok ? 1 : 0, static_cast<int>(mContext->status), mContext->gen_seq_len, generateMs,
+              _elapsedMs(totalStart));
+    return ok;
 }
 
 void Llm::completePrefixWrite() {

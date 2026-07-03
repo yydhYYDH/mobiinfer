@@ -25,6 +25,40 @@
 
 ---
 
+## DFlash / speculative draft 维度和运行时验证
+
+### 问题描述
+
+DFlash draft model 的 attention 布局不一定和 target model 完全一致。比如 target 是混合/多模态架构时，target 的 `head_dim`、`num_attention_heads`、`num_key_value_heads` 可能和 draft config 不同。导出时如果用 target config 构造 draft 层，会在加载 draft 权重时出现 norm/proj shape mismatch。
+
+另一个风险是：DFlash 导出成功不代表 runtime 可用。必须跑极短 C++ 推理，因为 speculative path 会额外访问 draft embedding、hidden_states、fc module 等普通导出不会覆盖的路径。
+
+### 判断方法
+
+1. 对比 target `config.json` 和 draft `config.json` 中的 `hidden_size`、`head_dim`、`num_attention_heads`、`num_key_value_heads`。
+2. draft 层结构应优先按 draft config 构建；只要求共享的 `hidden_size` 和 target embedding/lm_head 匹配。
+3. 导出后必须跑极短 runtime smoke test：
+
+```bash
+./llm_bench -m /path/to/DFLASH-MNN/config.json -a cpu -t 4 -p 8 -n 1 -rep 1 -kv true
+```
+
+如果发生 segfault，用 gdb 直接定位：
+
+```bash
+gdb --batch -ex run -ex bt --args ./llm_bench -m /path/to/DFLASH-MNN/config.json -a cpu -t 4 -p 8 -n 1 -rep 1 -kv true
+```
+
+### 解决方案
+
+- export wrapper 中 DFlash 自身 attention 维度优先读取 draft config。
+- 不要只以 `dflash.mnn` 文件生成作为通过标准；必须确认 C++ runtime 可以完成最短 decode。
+- 若 backtrace 落在 `DFlashGeneration::dflashForward -> embedding`，优先检查 embedding/tie_embeddings、多模态 `Omni::embedding`、mask token/block token 访问路径。
+
+---
+
+## 1. RoPE 旋转方式（half-half vs interleaved）
+
 ## 2. Vision embed_ dtype 级联问题
 
 ### 问题描述

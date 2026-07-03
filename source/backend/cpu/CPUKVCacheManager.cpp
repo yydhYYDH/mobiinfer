@@ -305,7 +305,8 @@ void CPUKVCacheManager::onAlloc(KVMeta* meta, int seq_len) {
     // load disk prefix kvcache
     if(mMeta != nullptr && mMeta->file_name.size() > 0 && mMeta->file_flag == KVMeta::PendingRead) {
         // create new files
-        std::string pathk    = MNNFilePathConcat(mConfig.mPrefixCacheDir, mMeta->file_name) + "_" + std::to_string(mMeta->layer_index) + ".k";
+        int readLayerIndex = mMeta->layer_index;
+        std::string pathk    = MNNFilePathConcat(mConfig.mPrefixCacheDir, mMeta->file_name) + "_" + std::to_string(readLayerIndex) + ".k";
         std::string pathv    = MNNFilePathConcat(mConfig.mPrefixCacheDir, mMeta->file_name) + "_" + std::to_string(mMeta->layer_index++) + ".v";
         mMeta->layer_index = mMeta->layer_index % mMeta->layer_nums;
         auto old_key_fd   = MNNOpenFile(pathk.c_str(), MNN_FILE_WRITE);
@@ -322,15 +323,22 @@ void CPUKVCacheManager::onAlloc(KVMeta* meta, int seq_len) {
         auto oldValueSize = MNNGetFileSize(old_value_fd);
 
         size_t oldMaxLength = 0;
+        size_t oldKeyMaxLength = 0;
+        size_t oldValueMaxLength = 0;
         if (mKeyQuantMode != KVQuantMode::None || mValueQuantMode != KVQuantMode::None) {
             MNN_ERROR("[Error]: Currently, kvcache save in disk not support quantized key/value\n");
         } else {
-            size_t oldKeyMaxLength = oldKeySize / (mKvNumHead * ROUND_UP(mHeadDim, lP) * mBytes);
-            size_t oldValueMaxLength = oldValueSize / (mKvNumHead * ROUND_UP(mHeadDim, hP) * mBytes);
+            oldKeyMaxLength = oldKeySize / (mKvNumHead * ROUND_UP(mHeadDim, lP) * mBytes);
+            oldValueMaxLength = oldValueSize / (mKvNumHead * ROUND_UP(mHeadDim, hP) * mBytes);
             oldMaxLength = ALIMIN(oldKeyMaxLength, oldValueMaxLength);
         }
         if(oldMaxLength < meta->seqlen_in_disk) {
-            MNN_ERROR("[Error]: Kvcache in disk size smaller than saved lengthInDiskToload:%d\n", (int)meta->seqlen_in_disk);
+            MNN_ERROR("[Error]: Kvcache in disk size smaller than saved lengthInDiskToload:%d layer=%d cache=%s\n",
+                      (int)meta->seqlen_in_disk, readLayerIndex, meta->file_name.c_str());
+            MNN_ERROR("[Error]: key_file=%s key_size=%zu key_max_len=%zu value_file=%s value_size=%zu value_max_len=%zu old_max_len=%zu kv_heads=%d head_dim=%d bytes=%d hP=%d lP=%d previous=%zu add=%zu remove=%zu layer_nums=%d\n",
+                      pathk.c_str(), oldKeySize, oldKeyMaxLength, pathv.c_str(), oldValueSize, oldValueMaxLength,
+                      oldMaxLength, mKvNumHead, mHeadDim, mBytes, hP, lP, meta->previous, meta->add,
+                      meta->remove, meta->layer_nums);
         }
 
         // Update mMaxLength first, then setFlashAttentionUpperKv to avoid division by zero

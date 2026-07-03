@@ -94,6 +94,9 @@ void ArGeneration::generate(GenerationParams& param) {
             *mContext->os << decodeStr;
             *mContext->os << std::flush;
         }
+        if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
+            break;
+        }
         // Compute Next Logits
 #ifdef DUMP_PROFILE_INFO
         MNN::Timer _t_fwd;

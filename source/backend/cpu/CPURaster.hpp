@@ -8,6 +8,7 @@
 #ifndef CPURaster_hpp
 #define CPURaster_hpp
 #include "CPUBackend.hpp"
+#include <string>
 #include <map>
 #include <set>
 #include "core/TensorUtils.hpp"
@@ -15,8 +16,10 @@
 namespace MNN {
 class CPURaster : public Execution {
 public:
-    CPURaster(Backend* bn) : Execution(bn) {
-        // Do nothing
+    CPURaster(Backend* bn, const Op* op = nullptr) : Execution(bn) {
+        if (nullptr != op && nullptr != op->name()) {
+            mOpName = op->name()->str();
+        }
     }
     virtual ~ CPURaster() {
         // Do nothing
@@ -39,6 +42,8 @@ private:
     bool mHasReduce = false;
     bool mUseThreads = false;
     std::vector<std::pair<std::function<void(int)>, int>> mTasks;
+    std::string mOpName;
+    std::string mProfileInfo;
 };
 }
 #endif

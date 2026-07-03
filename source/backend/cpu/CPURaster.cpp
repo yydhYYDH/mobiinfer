@@ -17,6 +17,9 @@
 #include "CPUBinary.hpp"
 #include "core/BufferAllocator.hpp"
 #include "CPUResizeCache.hpp"
+#include "core/ProfileExecutionInfo.hpp"
+
+#include <sstream>
 
 using Vec4 = MNN::Math::Vec<float, 4>;
 namespace MNN {
@@ -82,6 +85,35 @@ static void _transpose(int32_t* dstO, const int32_t* srcO, const Tensor::InsideD
     }
 }
 typedef void (*BlitProc)(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds);
+
+static int64_t _rasterRegionElements(const Tensor::InsideDescribe::Region& slice) {
+    return static_cast<int64_t>(slice.size[0]) * slice.size[1] * slice.size[2];
+}
+
+static bool _rasterIsContiguousCopy(const Tensor::InsideDescribe::Region& slice) {
+    return slice.src.stride[2] == 1 && slice.dst.stride[2] == 1 && slice.src.stride[1] == slice.size[2] &&
+           slice.dst.stride[1] == slice.size[2];
+}
+
+static bool _rasterIsStrideCopy(const Tensor::InsideDescribe::Region& slice) {
+    return !_rasterIsContiguousCopy(slice) && slice.src.stride[2] != 0 && slice.dst.stride[2] != 0;
+}
+
+static bool _rasterHasBroadcast(const Tensor::InsideDescribe::Region& slice) {
+    return (slice.size[0] > 1 && (slice.src.stride[0] == 0 || slice.dst.stride[0] == 0)) ||
+           (slice.size[1] > 1 && (slice.src.stride[1] == 0 || slice.dst.stride[1] == 0)) ||
+           (slice.size[2] > 1 && (slice.src.stride[2] == 0 || slice.dst.stride[2] == 0));
+}
+
+static void _rasterAppendRegion(std::ostringstream& os, const Tensor::InsideDescribe::Region& slice,
+                                const char* prefix) {
+    os << " " << prefix << "Size=" << slice.size[0] << "x" << slice.size[1] << "x" << slice.size[2];
+    os << " " << prefix << "SrcStride=" << slice.src.stride[0] << "x" << slice.src.stride[1] << "x"
+       << slice.src.stride[2];
+    os << " " << prefix << "DstStride=" << slice.dst.stride[0] << "x" << slice.dst.stride[1] << "x"
+       << slice.dst.stride[2];
+    os << " " << prefix << "SrcOffset=" << slice.src.offset << " " << prefix << "DstOffset=" << slice.dst.offset;
+}
 
 static void _4BitcopyWithStrideC4(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
     auto src = (float*)srcO;
@@ -412,6 +444,56 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
 #endif
     }
     size_t bytes = (size_t)(CPUBackend::getBytes(backend(), output));
+    int64_t regionElements = 0;
+    int contiguousRegions = 0;
+    int strideRegions = 0;
+    int broadcastRegions = 0;
+    for (auto& slice : des->regions) {
+        regionElements += _rasterRegionElements(slice);
+        if (_rasterIsContiguousCopy(slice)) {
+            contiguousRegions++;
+        } else if (_rasterIsStrideCopy(slice)) {
+            strideRegions++;
+        }
+        if (_rasterHasBroadcast(slice)) {
+            broadcastRegions++;
+        }
+    }
+    auto updateProfileInfo = [&](const char* path, int finalThreadNum) {
+        if (mOpName.empty()) {
+            return;
+        }
+        std::ostringstream rasterInfo;
+        rasterInfo << "CPU CPURaster"
+                   << " path=" << path
+                   << " bytes=" << bytes
+                   << " outputElements=" << output->elementSize()
+                   << " regionCount=" << des->regions.size()
+                   << " regionElements=" << regionElements
+                   << " regionBytes=" << static_cast<uint64_t>(regionElements) * bytes
+                   << " contiguousRegions=" << contiguousRegions
+                   << " strideRegions=" << strideRegions
+                   << " broadcastRegions=" << broadcastRegions
+                   << " fast=" << (mFast ? "true" : "false")
+                   << " tempInputs=" << mTempInput.size()
+                   << " tempInputCopies=" << mTempInputCopy.size()
+                   << " tempOutput=" << (nullptr != mTempOutput ? "true" : "false")
+                   << " hasReduce=" << (mHasReduce ? "true" : "false")
+                   << " needZero=" << (mNeedZero ? "true" : "false")
+                   << " overlap=" << (outputDes->overlap ? "true" : "false")
+                   << " useThreads=" << (mUseThreads ? "true" : "false")
+                   << " threadNum=" << finalThreadNum
+                   << " taskCount=" << mTasks.size();
+        if (!des->regions.empty()) {
+            _rasterAppendRegion(rasterInfo, des->regions[0], "r0");
+        }
+        if (des->regions.size() > 1) {
+            _rasterAppendRegion(rasterInfo, des->regions[des->regions.size() - 1], "rLast");
+        }
+        mProfileInfo = rasterInfo.str();
+        setProfileExecutionInfo(mOpName, mProfileInfo);
+        setProfileExecutionBytes(mOpName, static_cast<uint64_t>(regionElements) * bytes);
+    };
     mTempInput.clear();
     mFastBlit.clear();
     mCacheRegions.clear();
@@ -422,6 +504,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
     mFast = false;
     auto core = static_cast<CPUBackend*>(backend())->functions();
     mSingleConvert.type = 0;
+    mHasReduce = false;
     // all_srcFormat == dstFormat == NC4HW4 : Fast Exe
     if (outputDes->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
         mFast = true;
@@ -448,6 +531,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
                 mFastBlit.emplace_back(std::make_pair(slice.origin, std::move(newRegion)));
             }
             executeFaster(____inputs, outputs);
+            updateProfileInfo("fast_blit", mUseThreads ? threadNum : 1);
             return NO_ERROR;
         }
     }
@@ -473,6 +557,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
                     };
                     task.second = 1;
                     mTasks.emplace_back(task);
+                    updateProfileInfo("single_convert_memcpy", 1);
                     return NO_ERROR;
                 }
                 inputBatchStride = batchStrideC4;
@@ -488,6 +573,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
                     };
                     task.second = 1;
                     mTasks.emplace_back(task);
+                    updateProfileInfo("single_convert_memcpy", 1);
                     return NO_ERROR;
                 }
                 outputBatchStride = batchStrideC4;
@@ -505,6 +591,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
             };
             task.second = threadNum;
             mTasks.emplace_back(task);
+            updateProfileInfo("single_convert", threadNum);
             return NO_ERROR;
         }
     }
@@ -685,6 +772,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
     if (outputDescribe->overlap) {
         threadNum = 1;
     }
+    updateProfileInfo("general", threadNum);
     mTasks.emplace_back(std::make_pair([this, threadNum, output, bytes, core](int tId){
         void* mOutputPtr = nullptr;
         if (nullptr != mTempOutput) {
@@ -712,6 +800,9 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
 
 
 ErrorCode CPURaster::onExecute(const std::vector<Tensor *> &____inputs, const std::vector<Tensor *> &outputs) {
+    if (!mOpName.empty() && !mProfileInfo.empty()) {
+        setProfileExecutionInfo(mOpName, mProfileInfo);
+    }
     void* mOutputPtr = nullptr;
     if (nullptr != mTempOutput) {
         mOutputPtr = mTempOutput->host<void>();
@@ -1217,7 +1308,7 @@ public:
             }
             return new CPULoop(backend, op->main_as_LoopParam());
         }
-        return new CPURaster(backend);
+        return new CPURaster(backend, op);
     }
 };
 

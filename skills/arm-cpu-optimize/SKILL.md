@@ -146,6 +146,7 @@ LLM 低 bit kernel 额外验证：
 | w2 偶发复读误判为 kernel bug | 用 greedy/no-thinking、FP16 对照、短 prompt 做区分 |
 | 只堆 unroll 性能反降 | 先看寄存器压力、unpack issue、load/store、branch 和 postprocess |
 | 小 shape 调用重型函数变慢 | 小规模保留朴素/Vec4 路径，大规模才用 pack+matmul |
+| 只给通用路径加 profile 导致热点漏记 | 算子 instrumentation 要覆盖 fast path、format convert、early return 和 fallback 路径 |
 
 ## 参考文件
 
