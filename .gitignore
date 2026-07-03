@@ -451,7 +451,7 @@ test_qwen3vl_op.txt
 
 
 opbuild_out/
-source/backend/hiai/custom/
+# source/backend/hiai/custom/
 
 
 ascendc_layernorm_custom/
