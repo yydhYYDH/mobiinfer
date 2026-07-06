@@ -1034,6 +1034,9 @@ class Qwen3Vision(Qwen2Vision):
         image_norm = 1 / (np.array(self.norm_std) * 255.0)
         self.llm_config['image_mean'] = image_mean.tolist()
         self.llm_config['image_norm'] = image_norm.tolist()
+        self.llm_config['image_size_unit'] = self.patch_size * self.merge_size
+        self.llm_config['image_min_pixels'] = self.min_pixels
+        self.llm_config['image_max_pixels'] = self.max_pixels
         self.llm_config['num_grid_per_side'] = self.num_grid_per_side
         self.llm_config['has_deepstack'] = True
 
