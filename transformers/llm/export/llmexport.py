@@ -484,7 +484,7 @@ class LlmExporter(torch.nn.Module):
             for i in range(len(self.model.blocks)):
                 # different kv cache shape in different layers
                 # if isinstance(self.config.num_attention_heads, list):
-                self.model.blocks[i].self_attn.export_fused_attn = True
+                self.model.blocks[i].self_attn.export_fused_attn = os.environ.get("MNN_DISABLE_LLM_FUSED_ATTENTION") != "1"
                 is_moe = hasattr(self.model.blocks[i].mlp, 'is_moe') and self.model.blocks[i].mlp.is_moe
                 if is_moe:
                     self.model.blocks[i].mlp.export_moe = True
@@ -1324,7 +1324,7 @@ class EmbeddingExporter(LlmExporter):
         if self.args.onnx_slim:
             self.slim_onnx(onnx_model)
         if export_mnn:
-            transformer_fuse = not self.model.is_reranker
+            transformer_fuse = not self.model.is_reranker and os.environ.get("MNN_DISABLE_LLM_TRANSFORMER_FUSE") != "1"
             tie_embeddings_info = MNNConverter(self, self.unloaded_ops).export(onnx_model, transformer_fuse=transformer_fuse)
             if tie_embeddings_info is not None:
                 self.llm_config['tie_embeddings'] = tie_embeddings_info
