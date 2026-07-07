@@ -14,7 +14,7 @@ class Vision(torch.nn.Module):
         super().__init__()
         self.quant_bit = 8
         self.quant_block = 128
-        self.transformer_fuse = True
+        self.transformer_fuse = False
         self.group_conv_native = False
         self.model_type = base.config.model_type
         self.visual = visual.eval()
@@ -272,6 +272,9 @@ class Qwen2Vision(Vision):
         self.vision_end_id = self.config.vision_end_token_id
         self.image_pad_id = self.config.image_token_id
         self.llm_config['image_size'] = self.image_height
+        self.llm_config['image_size_unit'] = self.patch_size * self.merge_size
+        self.llm_config['image_min_pixels'] = self.min_pixels
+        self.llm_config['image_max_pixels'] = self.max_pixels
         self.llm_config['vision_start'] = self.vision_start_id
         self.llm_config['vision_end'] = self.vision_end_id
         self.llm_config['image_pad'] = self.image_pad_id
@@ -1002,6 +1005,9 @@ class Qwen3Vision(Qwen2Vision):
 
         self.min_pixels = 65536
         self.max_pixels = 16777216
+        self.llm_config['image_size_unit'] = self.patch_size * self.merge_size
+        self.llm_config['image_min_pixels'] = self.min_pixels
+        self.llm_config['image_max_pixels'] = self.max_pixels
         self.merge_unit = self.merge_size * self.merge_size
         self.deepstack_visual_indexes = visual.deepstack_visual_indexes
         self.num_grid_per_side = visual.num_grid_per_side
@@ -1304,6 +1310,9 @@ class Qwen3_5Vision(Qwen2Vision):
 
         self.min_pixels = 65536
         self.max_pixels = 16777216
+        self.llm_config['image_size_unit'] = self.patch_size * self.merge_size
+        self.llm_config['image_min_pixels'] = self.min_pixels
+        self.llm_config['image_max_pixels'] = self.max_pixels
         self.merge_unit = self.merge_size * self.merge_size
         self.num_grid_per_side = visual.num_grid_per_side
         self.pos_embed = visual.pos_embed
