@@ -7,6 +7,10 @@
 #include "ngram.hpp"
 #include "lookahead.hpp"
 #include "generate.hpp"
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 //#define DUMP_PROFILE_INFO
 
@@ -14,35 +18,186 @@ using namespace MNN::Express;
 namespace MNN {
 namespace Transformer {
 
-LookaheadGeneration::LookaheadGeneration(Llm* llm, std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config) : Generation(llm, context) {
+struct LookaheadNgramCache {
+    ngram_cache<ngram_value> freqCache;
+    ngram_cache<ngram_ordered_value> orderedCache;
+};
+
+namespace {
+
+static bool hasSuffix(const std::string& text, const std::string& suffix) {
+    return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool parseInt(const std::string& text, int* value) {
+    if (text.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0') {
+        return false;
+    }
+    *value = static_cast<int>(parsed);
+    return true;
+}
+
+static bool parseNgramTableLine(const std::string& line, int maxKeyLen, ngram_key* key, int* nextToken, int* count) {
+    if (line.empty() || line[0] == '#') {
+        return false;
+    }
+    if (line.compare(0, 2, "n\t") == 0) {
+        return false;
+    }
+    size_t tab0 = line.find('\t');
+    if (tab0 == std::string::npos) {
+        return false;
+    }
+    size_t tab1 = line.find('\t', tab0 + 1);
+    if (tab1 == std::string::npos) {
+        return false;
+    }
+    size_t tab2 = line.find('\t', tab1 + 1);
+    if (tab2 == std::string::npos) {
+        return false;
+    }
+
+    int keyLen = 0;
+    if (!parseInt(line.substr(0, tab0), &keyLen) || keyLen <= 0 || keyLen > maxKeyLen || keyLen > MNN_NGRAM_KEY_MAX) {
+        return false;
+    }
+    if (!parseInt(line.substr(tab1 + 1, tab2 - tab1 - 1), nextToken) || !parseInt(line.substr(tab2 + 1), count) ||
+        *count <= 0) {
+        return false;
+    }
+
+    ngram_key parsedKey;
+    size_t start = tab0 + 1;
+    int parsedLen = 0;
+    while (start <= tab1 && parsedLen < keyLen) {
+        size_t comma = line.find(',', start);
+        size_t end = (comma == std::string::npos || comma > tab1) ? tab1 : comma;
+        int token = 0;
+        if (!parseInt(line.substr(start, end - start), &token)) {
+            return false;
+        }
+        parsedKey.keys[parsedLen++] = token;
+        if (end == tab1) {
+            break;
+        }
+        start = end + 1;
+    }
+    if (parsedLen != keyLen) {
+        return false;
+    }
+    *key = parsedKey;
+    return true;
+}
+
+static int loadNgramTable(ngram_cache<ngram_value>& data, const std::string& path, int maxKeyLen) {
+    if (path.empty()) {
+        return 0;
+    }
+    if (hasSuffix(path, ".gz")) {
+        MNN_PRINT("Warning: ngram_table_file only supports plain TSV, not gzip: %s\n", path.c_str());
+        return 0;
+    }
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return 0;
+    }
+    std::string line;
+    int loaded = 0;
+    while (std::getline(file, line)) {
+        ngram_key key;
+        int nextToken = 0;
+        int count = 0;
+        if (!parseNgramTableLine(line, maxKeyLen, &key, &nextToken, &count)) {
+            continue;
+        }
+        data[key][nextToken] += count;
+        loaded++;
+    }
+    if (loaded > 0) {
+        MNN_PRINT("Loaded %d prebuilt ngram table entries from %s\n", loaded, path.c_str());
+    }
+    return loaded;
+}
+
+static int loadNgramTable(ngram_cache<ngram_ordered_value>& data, const std::string& path, int maxKeyLen) {
+    if (path.empty()) {
+        return 0;
+    }
+    if (hasSuffix(path, ".gz")) {
+        MNN_PRINT("Warning: ngram_table_file only supports plain TSV, not gzip: %s\n", path.c_str());
+        return 0;
+    }
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return 0;
+    }
+    std::string line;
+    int loaded = 0;
+    while (std::getline(file, line)) {
+        ngram_key key;
+        int nextToken = 0;
+        int count = 0;
+        if (!parseNgramTableLine(line, maxKeyLen, &key, &nextToken, &count)) {
+            continue;
+        }
+        data[key].push_back(nextToken);
+        loaded++;
+    }
+    if (loaded > 0) {
+        MNN_PRINT("Loaded %d prebuilt ngram table entries from %s\n", loaded, path.c_str());
+    }
+    return loaded;
+}
+
+} // namespace
+
+LookaheadGeneration::LookaheadGeneration(Llm* llm, std::shared_ptr<LlmContext> context,
+                                         std::shared_ptr<LlmConfig> config)
+    : Generation(llm, context) {
     mNgramKeyMaxLen = config->ngram_match_maxlen();
-    if(mNgramKeyMaxLen > 8) {
+    if (mNgramKeyMaxLen > 8) {
         MNN_PRINT("Warning: ngram match key length maybe too large!\n");
     }
     auto strictness = config->draft_match_strictness();
     mStrictLevel = MatchStrictLevel::LOW_LEVEL;
-    if(strictness == "high") {
+    if (strictness == "high") {
         mStrictLevel = MatchStrictLevel::HIGH_LEVEL;
-    } else if(strictness == "medium") {
+    } else if (strictness == "medium") {
         mStrictLevel = MatchStrictLevel::MEDIUM_LEVEL;
-    } else if(strictness == "low"){
+    } else if (strictness == "low") {
         mStrictLevel = MatchStrictLevel::LOW_LEVEL;
     } else {
         MNN_PRINT("Warning: draft_match_strictness value set error!, use default param instead\n");
     }
-    
+
     auto selectRule = config->draft_selection_rule();
     mSelectRule = NgramSelectRule::FreqxLen_RULE;
-    if(selectRule == "fcfs") {
+    if (selectRule == "fcfs") {
         mSelectRule = NgramSelectRule::FCFS_RULE;
-    } else if(selectRule == "freqxlen"){
+    } else if (selectRule == "freqxlen") {
         mSelectRule = NgramSelectRule::FreqxLen_RULE;
     } else {
         MNN_PRINT("Warning: draft_selection_rule value set error!, use default param instead\n");
     }
     mUpdateNgram = config->ngram_update();
+
+    auto ngramTableFile = config->ngram_table_file();
+    mPrebuiltNgram.reset(new LookaheadNgramCache);
+    if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+        mHasPrebuiltNgram = loadNgramTable(mPrebuiltNgram->freqCache, ngramTableFile, mNgramKeyMaxLen) > 0;
+    } else {
+        mHasPrebuiltNgram = loadNgramTable(mPrebuiltNgram->orderedCache, ngramTableFile, mNgramKeyMaxLen) > 0;
+    }
+    if (!mHasPrebuiltNgram) {
+        mPrebuiltNgram.reset();
+    }
 }
-    
+
 void LookaheadGeneration::generate(GenerationParams& param) {
     if (-1 == mContext->current_token) {
         mContext->current_token = mLlm->sample(param.outputs[0]);
@@ -51,15 +206,22 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     int len = 0;
     ngram_cache<ngram_value> prompt_ngram_cache;
     ngram_cache<ngram_ordered_value> prompt_ngram_ordered_cache;
+    ngram_cache<ngram_value>* activeNgramCache = &prompt_ngram_cache;
+    ngram_cache<ngram_ordered_value>* activeNgramOrderedCache = &prompt_ngram_ordered_cache;
 
-    if(mSelectRule == NgramSelectRule::FreqxLen_RULE) {
-        ngram_cache_update(prompt_ngram_cache, 1, mNgramKeyMaxLen, mContext->history_tokens, mContext->history_tokens.size());
+    if (mHasPrebuiltNgram) {
+        activeNgramCache = &mPrebuiltNgram->freqCache;
+        activeNgramOrderedCache = &mPrebuiltNgram->orderedCache;
+    } else if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+        ngram_cache_update(prompt_ngram_cache, 1, mNgramKeyMaxLen, mContext->history_tokens,
+                           mContext->history_tokens.size());
     } else {
-        ngram_cache_update(prompt_ngram_ordered_cache, 1, mNgramKeyMaxLen, mContext->history_tokens, mContext->history_tokens.size());
+        ngram_cache_update(prompt_ngram_ordered_cache, 1, mNgramKeyMaxLen, mContext->history_tokens,
+                           mContext->history_tokens.size());
     }
-    
-    // user provided info to create ngram
-    {
+
+    // user provided text info to create ngram. Used as fallback when no prebuilt token-id table is loaded.
+    if (!mHasPrebuiltNgram) {
         auto prior_prompt_file = mLlm->mConfig->lookup_file();
         std::ifstream file(prior_prompt_file);
 
@@ -69,8 +231,8 @@ void LookaheadGeneration::generate(GenerationParams& param) {
             std::string user_set_prompt = buffer.str();
             file.close();
             std::vector<int> user_ids = mLlm->tokenizer_encode(user_set_prompt);
-            
-            if(mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+
+            if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
                 ngram_cache_update(prompt_ngram_cache, 1, mNgramKeyMaxLen, user_ids, user_ids.size());
             } else {
                 ngram_cache_update(prompt_ngram_ordered_cache, 1, mNgramKeyMaxLen, user_ids, user_ids.size());
@@ -88,7 +250,7 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     int spl_count = 0;
     int verify_len = mLlm->mDraftLength + 1;
     while (len < max_token) {
-        if(mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
+        if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
             break;
         }
         if (param.timeout_ms > 0 && (mContext->prefill_us + mContext->decode_us) / 1000 >= param.timeout_ms) {
@@ -98,7 +260,7 @@ void LookaheadGeneration::generate(GenerationParams& param) {
         MNN::Timer _t;
         std::vector<int> drafts;
         drafts.push_back(mContext->current_token);
-        
+
         auto decodeStr = mLlm->tokenizer_decode(mContext->current_token);
         mContext->generate_str += decodeStr;
         if (nullptr != mContext->os) {
@@ -110,29 +272,30 @@ void LookaheadGeneration::generate(GenerationParams& param) {
 
         {
             // draft is "," or "." or ":" or "、", match maybe confusion
-            bool confuse = decodeStr == "," || decodeStr == "." || decodeStr == ":" || \
-                decodeStr == "、" || decodeStr == ";" || \
-                decodeStr == "，" || decodeStr == "。" || decodeStr == "：" || \
-                // Chinese comma and semicolon
-                decodeStr == "、" || decodeStr == "；";
+            bool confuse = decodeStr == "," || decodeStr == "." || decodeStr == ":" || decodeStr == "、" ||
+                           decodeStr == ";" || decodeStr == "，" || decodeStr == "。" ||
+                           decodeStr == "：" || // Chinese comma and semicolon
+                           decodeStr == "、" || decodeStr == "；";
             MatchStrictLevel level = mStrictLevel;
             // for confuse key, set match_strictness to high
-            if(confuse) {
+            if (confuse) {
                 level = MatchStrictLevel::HIGH_LEVEL;
             }
             // generate draft tokens
-            if(mSelectRule == NgramSelectRule::FreqxLen_RULE) {
-                ngram_cache_search(prompt_ngram_cache, 1, mNgramKeyMaxLen, mContext->history_tokens, drafts, verify_len, level);
+            if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+                ngram_cache_search(*activeNgramCache, 1, mNgramKeyMaxLen, mContext->history_tokens, drafts, verify_len,
+                                   level);
             } else {
-                ngram_cache_search(prompt_ngram_ordered_cache, 1, mNgramKeyMaxLen, mContext->history_tokens, drafts, verify_len, level);
+                ngram_cache_search(*activeNgramOrderedCache, 1, mNgramKeyMaxLen, mContext->history_tokens, drafts,
+                                   verify_len, level);
             }
-            
+
             mLlm->mMeta->add = drafts.size();
 
             AUTOTIME;
             // do draft token parallel verify
             auto outputs = mLlm->forwardVec(drafts);
-            if(outputs.empty()) {
+            if (outputs.empty()) {
                 break;
             }
             auto logits = outputs[0];
@@ -147,41 +310,41 @@ void LookaheadGeneration::generate(GenerationParams& param) {
             int i_dft = draftVerify(logits, drafts, stop);
 
             // update ngram for each decoding
-            if(!stop && mUpdateNgram) {
-                if(mSelectRule == NgramSelectRule::FreqxLen_RULE) {
-                    ngram_cache_update(prompt_ngram_cache, 1, mNgramKeyMaxLen, mContext->history_tokens, i_dft);
+            if (!stop && mUpdateNgram) {
+                if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+                    ngram_cache_update(*activeNgramCache, 1, mNgramKeyMaxLen, mContext->history_tokens, i_dft);
                 } else {
-                    ngram_cache_update(prompt_ngram_ordered_cache, 1, mNgramKeyMaxLen, mContext->history_tokens, i_dft);
+                    ngram_cache_update(*activeNgramOrderedCache, 1, mNgramKeyMaxLen, mContext->history_tokens, i_dft);
                 }
             }
 
             // clear dirty kv-cache
             mLlm->mMeta->remove = drafts.size() - i_dft;
             len += i_dft;
-            
+
             // update context state
             int seq_len = i_dft;
             int gen_len = i_dft - 1; // current_token has been added, add others
             mLlm->updateContext(seq_len, gen_len);
-            
+
             // count time cost
             mContext->decode_us += _t.durationInUs();
 
             // add all accept tokens to string
             mContext->history_tokens.insert(mContext->history_tokens.end(), drafts.begin(), drafts.begin() + i_dft);
             mContext->output_tokens.insert(mContext->output_tokens.end(), drafts.begin(), drafts.begin() + i_dft);
-            
-        #ifdef DUMP_PROFILE_INFO
+
+#ifdef DUMP_PROFILE_INFO
             MNN_PRINT("\ndraft num:%d, adopt num:%d\n", drafts.size(), i_dft);
-            if(drafts.size() > 1) {
+            if (drafts.size() > 1) {
                 spl_decode += drafts.size();
                 spl_accept += i_dft;
                 spl_count++;
             } else {
                 arg_count++;
             }
-        #endif
-            if(stop) {
+#endif
+            if (stop) {
                 mContext->history_tokens.push_back(mContext->current_token);
                 mContext->output_tokens.push_back(mContext->current_token);
                 mLlm->updateContext(0, 1);
@@ -198,7 +361,7 @@ void LookaheadGeneration::generate(GenerationParams& param) {
             }
         }
     }
-    if(len >= max_token) {
+    if (len >= max_token) {
         mContext->status = LlmStatus::MAX_TOKENS_FINISHED;
     }
 #ifdef DUMP_PROFILE_INFO
@@ -206,7 +369,7 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     float spl_rate = 100.0 * spl_count / (spl_count + arg_count);
     // draft accept rate if adopt speculative decoding
     float spl_accept_rate = 100.0 * spl_accept / spl_decode;
-    
+
     MNN_PRINT("\n============== Speculative Decoding Statistics Start ===============\n");
     MNN_PRINT("Adopt speculative decode rate: %.2f%%\n", spl_rate);
     MNN_PRINT("Average speculative decode accept rate: %.2f%%\n", spl_accept_rate);
@@ -220,13 +383,14 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     float spl_time = spl_count * spl_cost_rate + arg_count;
     float speed_up = 1.0 * arg_time / spl_time;
     MNN_PRINT("Verify length is: %d\n", verify_len);
-    MNN_PRINT("Assume decode %d token is %.2f times consumption than single token decoding\n", verify_len, spl_cost_rate);
+    MNN_PRINT("Assume decode %d token is %.2f times consumption than single token decoding\n", verify_len,
+              spl_cost_rate);
     MNN_PRINT("Total speed up is around: %.2fx\n", speed_up);
     MNN_PRINT("============== Speculative Decoding Statistics End =================\n");
 
 #endif
     return;
 }
-    
+
 } // namespace Transformer
 } // namespace MNN

@@ -634,6 +634,18 @@ public:
     }
     /**
      if speculative_type is set "lookahead",
+     optional prebuilt token-id ngram table. TSV format:
+     n\tkey_token_ids(comma separated)\tnext_token_id\tcount
+     */
+    std::string ngram_table_file() const {
+        auto file = config_.value("ngram_table_file", std::string(""));
+        if (file.empty()) {
+            return "";
+        }
+        return base_dir_ + file;
+    }
+    /**
+     if speculative_type is set "lookahead",
      whether should  add decode token to ngram
      */
     bool ngram_update() const {

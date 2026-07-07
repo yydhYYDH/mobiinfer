@@ -50,6 +50,8 @@ public:
     virtual void generate(GenerationParams& param);
 };
 
+struct LookaheadNgramCache;
+
 class LookaheadGeneration: public Generation {
 public:
     LookaheadGeneration(Llm* llm, std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
@@ -60,6 +62,8 @@ private:
     MatchStrictLevel mStrictLevel;
     bool mUpdateNgram = false;
     NgramSelectRule mSelectRule;
+    bool mHasPrebuiltNgram = false;
+    std::shared_ptr<LookaheadNgramCache> mPrebuiltNgram;
 };
 
 class MtpGeneration: public Generation {
