@@ -8,6 +8,7 @@
 #include "lookahead.hpp"
 #include "generate.hpp"
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -249,6 +250,15 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     // speculative number of times
     int spl_count = 0;
     int verify_len = mLlm->mDraftLength + 1;
+    bool debugStats = mLlm->mConfig->lookahead_debug_stats();
+    bool debugStatsDetail = mLlm->mConfig->lookahead_debug_stats_detail();
+    int statSteps = 0;
+    int statSpecSteps = 0;
+    int statArSteps = 0;
+    int statDraftTokens = 0;
+    int statAcceptedDraftTokens = 0;
+    int statAcceptedTokens = 0;
+    int statFullAcceptSteps = 0;
     while (len < max_token) {
         if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
             break;
@@ -318,6 +328,31 @@ void LookaheadGeneration::generate(GenerationParams& param) {
                 }
             }
 
+            if (debugStats) {
+                int draftTokenNum = static_cast<int>(drafts.size()) - 1;
+                int acceptedDraftNum = i_dft - 1;
+                statSteps++;
+                statAcceptedTokens += i_dft;
+                if (draftTokenNum > 0) {
+                    statSpecSteps++;
+                    statDraftTokens += draftTokenNum;
+                    statAcceptedDraftTokens += acceptedDraftNum;
+                    if (i_dft == static_cast<int>(drafts.size())) {
+                        statFullAcceptSteps++;
+                    }
+                } else {
+                    statArSteps++;
+                }
+                if (debugStatsDetail) {
+                    std::fprintf(stderr,
+                                 "[LOOKAHEAD_STATS] step=%d drafts=%d accepted=%d draft_tokens=%d "
+                                 "accepted_draft_tokens=%d full_accept=%d current=%d\n",
+                                 statSteps, static_cast<int>(drafts.size()), i_dft, draftTokenNum,
+                                 acceptedDraftNum, i_dft == static_cast<int>(drafts.size()),
+                                 mContext->current_token);
+                }
+            }
+
             // clear dirty kv-cache
             mLlm->mMeta->remove = drafts.size() - i_dft;
             len += i_dft;
@@ -363,6 +398,20 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     }
     if (len >= max_token) {
         mContext->status = LlmStatus::MAX_TOKENS_FINISHED;
+    }
+    if (debugStats) {
+        float specStepRate = statSteps > 0 ? 100.0f * statSpecSteps / statSteps : 0.0f;
+        float draftAcceptRate = statDraftTokens > 0 ? 100.0f * statAcceptedDraftTokens / statDraftTokens : 0.0f;
+        float fullAcceptRate = statSpecSteps > 0 ? 100.0f * statFullAcceptSteps / statSpecSteps : 0.0f;
+        float avgAccepted = statSteps > 0 ? 1.0f * statAcceptedTokens / statSteps : 0.0f;
+        std::fprintf(stderr,
+                     "[LOOKAHEAD_STATS] summary steps=%d spec_steps=%d ar_steps=%d "
+                     "spec_step_rate=%.2f%% draft_tokens=%d accepted_draft_tokens=%d "
+                     "draft_accept_rate=%.2f%% full_accept_steps=%d full_accept_rate=%.2f%% "
+                     "accepted_tokens=%d avg_accepted_per_step=%.2f\n",
+                     statSteps, statSpecSteps, statArSteps, specStepRate, statDraftTokens,
+                     statAcceptedDraftTokens, draftAcceptRate, statFullAcceptSteps, fullAcceptRate,
+                     statAcceptedTokens, avgAccepted);
     }
 #ifdef DUMP_PROFILE_INFO
     // adopt speculative decoding rate
