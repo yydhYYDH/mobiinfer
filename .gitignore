@@ -492,3 +492,16 @@ transformers/llm/export/run_visual_blocks_pipeline.sh
 # smoke models converted on the host by ./test_ci.sh local (sources are fetched
 # into /smoke_sources/, then MNNConvert writes the .caffe.mnn here)
 /resource/model/**/*.caffe.mnn
+
+token_count
+
+# Local experiment artifacts
+artifacts/
+*.safetensors
+*.mnn
+*.mnn.weight
+*.weight
+
+# Local experiments
+experiments/
+test_pics/
