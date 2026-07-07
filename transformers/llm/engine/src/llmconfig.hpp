@@ -602,6 +602,12 @@ public:
     bool ngram_update() const {
         return config_.value("ngram_update", false);
     }
+    bool lookahead_debug_stats() const {
+        return config_.value("lookahead_debug_stats", false);
+    }
+    bool lookahead_debug_stats_detail() const {
+        return config_.value("lookahead_debug_stats_detail", false);
+    }
     // ========= lookahead config start ===============
 
     /**
