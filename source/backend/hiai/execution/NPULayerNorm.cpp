@@ -8,7 +8,6 @@
 
 #include "NPULayerNorm.hpp"
 #include "NPUBackend.hpp"
-#include "../custom/LayerNormCustomOp.hpp"
 #include "core/FileLoader.hpp"
 #include <sstream>
 
@@ -27,6 +26,10 @@
 // norm_size for the custom kernel's row-wise reduction.
 #ifndef MNN_HIAI_LN_USE_CUSTOM
 #define MNN_HIAI_LN_USE_CUSTOM 0
+#endif
+
+#if MNN_HIAI_LN_USE_CUSTOM
+#include "../custom/LayerNormCustomOp.hpp"
 #endif
 
 // Paddle-Lite Kirin NPU style path. When enabled (default), feeds gamma/beta

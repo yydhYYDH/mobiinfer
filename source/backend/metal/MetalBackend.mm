@@ -86,6 +86,7 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
     mRuntime = runtime;
     auto ctx = (__bridge MNNMetalContext *)runtime->context();
     mBufferPool.reset(runtime->createDynamicAllocator(0, false));
+    mExecutionBufferPool.reset(new EagerBufferAllocator(runtime->buffer(0)->root, 1024));
     mCurrentAllocator = mBufferPool.get();
     mUseFloatAsFp16 = usefp16AsFp32;
     mMemoryMode = mode;
@@ -269,6 +270,10 @@ Backend::MemObj* MetalBackend::onAcquire(const Tensor *_tensor, StorageType stor
             buffer = mCurrentAllocator->alloc(size, true);
             allocator = mCurrentAllocator;
         } break;
+        case Backend::DYNAMIC_IN_EXECUTION: {
+            buffer = mExecutionBufferPool->alloc(size, false);
+            allocator = mExecutionBufferPool.get();
+        } break;
         default:{
             break;
         }
@@ -291,6 +296,9 @@ Backend::MemObj* MetalBackend::onAcquire(const Tensor *_tensor, StorageType stor
 
 bool MetalBackend::onClearBuffer() {
     mCurrentAllocator->release(true);
+    if (mExecutionBufferPool.get() != nullptr) {
+        mExecutionBufferPool->release(true);
+    }
     if (nullptr != mRuntime->mStaticAllocatorRaw.get()) {
         mRuntime->mStaticAllocator->sync();
         mRuntime->mStaticAllocator = mRuntime->mStaticAllocatorRaw;
@@ -1067,12 +1075,23 @@ MetalRuntime::MetalRuntime(void* context) {
     mContext = context;
     auto ctx = (__bridge MNNMetalContext *)mContext;
     std::shared_ptr<EagerBufferAllocator::Allocator> allocator(new MetalRuntimeAllocator([ctx device]));
-    mSimdGroupReduce = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
-    mSimdGroupReduce |= [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal3_MNN];
-    mSimdGroupMatrix = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
+    // supportsFamily: is available since iOS 13.0 / macOS 10.15, must check before calling
+    if (@available(iOS 13.0, macOS 10.15, *)) {
+        mSimdGroupReduce = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
+        mSimdGroupReduce |= [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal3_MNN];
+        mSimdGroupMatrix = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
+    } else {
+        mSimdGroupReduce = false;
+        mSimdGroupMatrix = false;
+    }
+    mMaxThreadSize = [[ctx device] maxThreadsPerThreadgroup].width;
     // Metal4 Support M1/A14 and later chips
 #ifdef MNN_METAL_TENSOR
-    mTensorOps = [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal4_MNN];
+    if (@available(iOS 13.0, macOS 10.15, *)) {
+        mTensorOps = [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal4_MNN];
+    } else {
+        mTensorOps = false;
+    }
 
     // AI TensorCore device support from M5/A19
     bool noAICoreDevice = [[[ctx device] name] containsString:@"M1"] || \

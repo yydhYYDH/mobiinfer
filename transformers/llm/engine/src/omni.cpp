@@ -201,6 +201,26 @@ static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
     return _Const(vec.data(), dims, NHWC, halide_type_of<T>());
 }
 
+#ifdef LLM_SUPPORT_AUDIO
+static std::vector<int> buildOmniAudioWindowBoundaries(int seqlen, int n_window) {
+    const int clampedSeqlen = std::max(seqlen, 0);
+    std::vector<int> boundaries(1, 0);
+    if (n_window <= 0) {
+        if (clampedSeqlen > 0) {
+            boundaries.push_back(clampedSeqlen);
+        }
+        return boundaries;
+    }
+    for (int curseq = n_window; curseq < clampedSeqlen; curseq += n_window) {
+        boundaries.push_back(curseq);
+    }
+    if (boundaries.back() != clampedSeqlen) {
+        boundaries.push_back(clampedSeqlen);
+    }
+    return boundaries;
+}
+#endif
+
 static MNNForwardType backend_type_convert(const std::string& type_str) {
     if (type_str == "cpu")
         return MNN_FORWARD_CPU;
@@ -276,7 +296,7 @@ bool Omni::load() {
         }
         config.backendConfig = &cpuBackendConfig;
         mProcessorRuntimeManager.reset(Executor::RuntimeManager::createRuntimeManager(config));
-        setRuntimeHint(mProcessorRuntimeManager);
+        setRuntimeHint(mProcessorRuntimeManager, true, true);
     }
     if (mConfig->has_talker()) {
         mTalker.reset(new Talker(mConfig, this));
@@ -307,6 +327,8 @@ bool Omni::load() {
         module_config.shapeMutable = true;
         module_config.rearrange    = true;
     }
+    // pMeta isolation between LLM and processor RTMs is now provided by
+    // per-RTM RuntimeAttr::mPMeta + applyMetaToRuntime; no manual reset needed.
     if (mConfig->is_visual()) {
         if (mConfig->visual_split()) {
             // Split mode: pre/post on mProcessorRuntimeManager (usually CPU),
@@ -321,7 +343,7 @@ bool Omni::load() {
             // A/B switch: vision encoder blocks should not rely on decoder KV
             // hints. Keep default behavior (true) unless explicitly disabled.
             bool visualBlocksKvHints = mConfig->config_.value("visual_blocks_kv_hints", true);
-            setRuntimeHint(mVisionBlocksRuntimeManager, visualBlocksKvHints);
+            setRuntimeHint(mVisionBlocksRuntimeManager, false, visualBlocksKvHints);
 
             Module::Config npuModuleCfg;
             if (npuCfg.type == MNN_FORWARD_USER_0 ||
@@ -1421,6 +1443,12 @@ std::vector<int> Omni::visionProcess(VARP image) {
     } else {
         imgIds = defaultVisionProcess(image);
     }
+    bool async = mConfig->config_.value("async", true);
+    if (!async) {
+        for (auto& embd : mVisionEmbeddings) {
+            embd->readMap<float>();
+        }
+    }
     mContext->vision_us += _t.durationInUs();
     mContext->pixels_mp += (mVisionWidth / 1000.0f) * (mVisionHeight / 1000.0f);
     // set vision number for image idx
@@ -1479,19 +1507,12 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
         ::memcpy(fresh->writeMap<float>(), ptr, info->size * sizeof(float));
         input_features = fresh;
     }
+    // pMeta isolation handled by per-RTM RuntimeAttr::mPMeta; no reset needed.
     VARP audio_embedding;
     if (mAudioModule->getInfo()->inputNames.size() > 1) {
         int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
         constexpr int n_window = 100;
-        std::vector<int> cu_seqlens;
-        int curseq = 0;
-        while (curseq < seqlen) {
-            cu_seqlens.push_back(curseq);
-            curseq += n_window;
-        }
-        if (seqlen % n_window != 0) {
-            cu_seqlens.push_back(seqlen);
-        }
+        std::vector<int> cu_seqlens = buildOmniAudioWindowBoundaries(seqlen, n_window);
         VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
         auto ptr = attention_mask->writeMap<float>();
         for (int i = 0; i < seqlen; i++) {
@@ -1525,6 +1546,12 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     }
     mContext->audio_us = _t.durationInUs();
     mAudioEmbeddings.push_back(audio_embedding);
+    bool async = mConfig->config_.value("async", true);
+    if (!async) {
+        for (auto& embd : mAudioEmbeddings) {
+            embd->readMap<float>();
+        }
+    }
     int embed_len = audio_embedding->getInfo()->dim[0];
     addPositionIds(embed_len);
     std::vector<int> audio_ids(embed_len, mAudioPad);

@@ -272,7 +272,7 @@ static int eval(Llm* llm, std::string prompt_file, int max_token_number) {
     std::ifstream prompt_fs(prompt_file);
     std::vector<std::string> prompts;
     std::string prompt;
-//#define LLM_DEMO_ONELINE
+#define LLM_DEMO_ONELINE
 #ifdef LLM_DEMO_ONELINE
     std::ostringstream tempOs;
     tempOs << prompt_fs.rdbuf();
@@ -313,6 +313,8 @@ void chat(Llm* llm) {
         }
         if (user_str == "/reset") {
             llm->reset();
+            messages.clear();
+            messages.emplace_back("system", "You are a helpful assistant.");
             std::cout << "\nA: reset done." << std::endl;
             continue;
         }
