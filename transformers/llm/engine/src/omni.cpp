@@ -1748,6 +1748,10 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     std::vector<int> cur_txt_ids;
     bool inVision = false, inAudio = false;
     bool hasDeepStack = !mDeepStackEmbeddings.empty();
+    if (!hasDeepStack && mConfig->has_deepstack() && mExtraArgs.size() == 1) {
+        mExtraArgs[0] = Express::_Fill(_var<int>({3, static_cast<int>(input_ids.size()), 1}, {3}),
+                                      _Scalar<float>(0.0));
+    }
     std::vector<int> deepstackShape;
     if (hasDeepStack) {
         deepstackShape = mDeepStackEmbeddings[0]->getInfo()->dim; // N, seqlen, hddien_size
