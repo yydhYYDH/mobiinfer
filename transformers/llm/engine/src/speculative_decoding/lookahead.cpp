@@ -200,7 +200,7 @@ LookaheadGeneration::LookaheadGeneration(Llm* llm, std::shared_ptr<LlmContext> c
 
 void LookaheadGeneration::generate(GenerationParams& param) {
     if (-1 == mContext->current_token) {
-        mContext->current_token = mLlm->sample(param.outputs[0]);
+        mContext->current_token = mLlm->sample(param.outputs[0], param.validLogitStart, param.validLogitSize);
     }
     int max_token = param.max_new_tokens;
     int len = 0;
