@@ -44,6 +44,19 @@ static inline std::string file_name(const std::string& path) {
     }
 }
 
+static inline bool is_absolute_path(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+#ifdef _WIN32
+    return path.size() > 1 && path[1] == ':';
+#else
+    return false;
+#endif
+}
 
 class LlmConfig {
 public:
@@ -592,6 +605,9 @@ public:
         auto file = config_.value("ngram_table_file", std::string(""));
         if (file.empty()) {
             return "";
+        }
+        if (is_absolute_path(file)) {
+            return file;
         }
         return base_dir_ + file;
     }

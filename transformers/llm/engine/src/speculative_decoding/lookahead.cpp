@@ -9,9 +9,18 @@
 #include "generate.hpp"
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 //#define DUMP_PROFILE_INFO
 
@@ -41,6 +50,221 @@ static bool parseInt(const std::string& text, int* value) {
     }
     *value = static_cast<int>(parsed);
     return true;
+}
+
+
+static const uint32_t kNgramBinaryVersion = 2;
+static const char kNgramBinaryMagic[8] = {'M', 'N', 'N', 'N', 'G', 'R', 'M', '2'};
+
+static bool isBinaryNgramTable(const std::string& path) {
+    return hasSuffix(path, ".bin") || hasSuffix(path, ".mnnngram");
+}
+
+class ReadOnlyMappedFile {
+public:
+    explicit ReadOnlyMappedFile(const std::string& path) {
+#ifndef _WIN32
+        mFd = ::open(path.c_str(), O_RDONLY);
+        if (mFd < 0) {
+            return;
+        }
+        struct stat st;
+        if (::fstat(mFd, &st) != 0 || st.st_size <= 0) {
+            close();
+            return;
+        }
+        mSize = static_cast<size_t>(st.st_size);
+        void* mapped = ::mmap(nullptr, mSize, PROT_READ, MAP_PRIVATE, mFd, 0);
+        if (mapped == MAP_FAILED) {
+            close();
+            return;
+        }
+        mData = static_cast<const uint8_t*>(mapped);
+        mMapped = true;
+#else
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            return;
+        }
+        file.seekg(0, std::ios::end);
+        auto size = file.tellg();
+        if (size <= 0) {
+            return;
+        }
+        mBuffer.resize(static_cast<size_t>(size));
+        file.seekg(0, std::ios::beg);
+        file.read(reinterpret_cast<char*>(mBuffer.data()), size);
+        if (file.gcount() != size) {
+            mBuffer.clear();
+            return;
+        }
+        mData = mBuffer.data();
+        mSize = mBuffer.size();
+#endif
+    }
+
+    ~ReadOnlyMappedFile() {
+        close();
+    }
+
+    const uint8_t* data() const {
+        return mData;
+    }
+
+    size_t size() const {
+        return mSize;
+    }
+
+    bool valid() const {
+        return mData != nullptr && mSize > 0;
+    }
+
+private:
+    void close() {
+#ifndef _WIN32
+        if (mMapped && mData != nullptr) {
+            ::munmap(const_cast<uint8_t*>(mData), mSize);
+        }
+        if (mFd >= 0) {
+            ::close(mFd);
+        }
+        mFd = -1;
+        mMapped = false;
+#else
+        mBuffer.clear();
+#endif
+        mData = nullptr;
+        mSize = 0;
+    }
+
+    const uint8_t* mData = nullptr;
+    size_t mSize = 0;
+#ifndef _WIN32
+    int mFd = -1;
+    bool mMapped = false;
+#else
+    std::vector<uint8_t> mBuffer;
+#endif
+};
+
+static bool readU32(const uint8_t*& ptr, const uint8_t* end, uint32_t* value) {
+    if (ptr + sizeof(uint32_t) > end) {
+        return false;
+    }
+    uint32_t v = 0;
+    v |= static_cast<uint32_t>(ptr[0]);
+    v |= static_cast<uint32_t>(ptr[1]) << 8;
+    v |= static_cast<uint32_t>(ptr[2]) << 16;
+    v |= static_cast<uint32_t>(ptr[3]) << 24;
+    ptr += sizeof(uint32_t);
+    *value = v;
+    return true;
+}
+
+static bool readI32(const uint8_t*& ptr, const uint8_t* end, int* value) {
+    uint32_t raw = 0;
+    if (!readU32(ptr, end, &raw)) {
+        return false;
+    }
+    *value = static_cast<int32_t>(raw);
+    return true;
+}
+
+struct BinaryNgramEntry {
+    ngram_key key;
+    int keyLen = 0;
+    int nextToken = 0;
+    int count = 0;
+};
+
+static bool readBinaryNgramEntry(const uint8_t*& ptr, const uint8_t* end, int storedKeySlots,
+                                  BinaryNgramEntry* entry) {
+    uint32_t keyLen = 0;
+    if (!readU32(ptr, end, &keyLen) || keyLen == 0 || keyLen > static_cast<uint32_t>(storedKeySlots) ||
+        keyLen > MNN_NGRAM_KEY_MAX) {
+        return false;
+    }
+    ngram_key parsedKey;
+    for (int i = 0; i < storedKeySlots; i++) {
+        int token = 0;
+        if (!readI32(ptr, end, &token)) {
+            return false;
+        }
+        if (i < static_cast<int>(keyLen)) {
+            parsedKey.keys[i] = token;
+        }
+    }
+    int nextToken = 0;
+    int count = 0;
+    if (!readI32(ptr, end, &nextToken) || !readI32(ptr, end, &count) || count <= 0) {
+        return false;
+    }
+    entry->key = parsedKey;
+    entry->keyLen = static_cast<int>(keyLen);
+    entry->nextToken = nextToken;
+    entry->count = count;
+    return true;
+}
+
+template <typename Callback>
+static int loadBinaryNgramTableImpl(const std::string& path, int maxKeyLen, const Callback& callback) {
+    ReadOnlyMappedFile file(path);
+    if (!file.valid()) {
+        return 0;
+    }
+    const uint8_t* ptr = file.data();
+    const uint8_t* end = file.data() + file.size();
+    if (ptr + 24 > end || std::memcmp(ptr, kNgramBinaryMagic, sizeof(kNgramBinaryMagic)) != 0) {
+        MNN_PRINT("Warning: invalid binary ngram table header: %s\n", path.c_str());
+        return 0;
+    }
+    ptr += sizeof(kNgramBinaryMagic);
+    uint32_t version = 0;
+    uint32_t storedMaxKeyLen = 0;
+    uint32_t reserved = 0;
+    uint32_t entryCount = 0;
+    if (!readU32(ptr, end, &version) || !readU32(ptr, end, &storedMaxKeyLen) || !readU32(ptr, end, &reserved) ||
+        !readU32(ptr, end, &entryCount)) {
+        return 0;
+    }
+    if (version != kNgramBinaryVersion) {
+        MNN_PRINT("Warning: unsupported binary ngram table version %u: %s\n", version, path.c_str());
+        return 0;
+    }
+    if (storedMaxKeyLen == 0 || storedMaxKeyLen > MNN_NGRAM_KEY_MAX) {
+        MNN_PRINT("Warning: invalid binary ngram table max key len %u: %s\n", storedMaxKeyLen, path.c_str());
+        return 0;
+    }
+    (void)reserved;
+    int loaded = 0;
+    int storedKeySlots = static_cast<int>(storedMaxKeyLen);
+    for (uint32_t i = 0; i < entryCount; i++) {
+        BinaryNgramEntry entry;
+        if (!readBinaryNgramEntry(ptr, end, storedKeySlots, &entry)) {
+            break;
+        }
+        if (entry.keyLen > maxKeyLen) {
+            continue;
+        }
+        callback(entry);
+        loaded++;
+    }
+    if (loaded > 0) {
+        MNN_PRINT("Loaded %d binary prebuilt ngram table entries from %s\n", loaded, path.c_str());
+    }
+    return loaded;
+}
+
+static int loadBinaryNgramTable(ngram_cache<ngram_value>& data, const std::string& path, int maxKeyLen) {
+    return loadBinaryNgramTableImpl(path, maxKeyLen, [&data](const BinaryNgramEntry& entry) {
+        data[entry.key][entry.nextToken] += entry.count;
+    });
+}
+
+static int loadBinaryNgramTable(ngram_cache<ngram_ordered_value>& data, const std::string& path, int maxKeyLen) {
+    return loadBinaryNgramTableImpl(path, maxKeyLen, [&data](const BinaryNgramEntry& entry) {
+        data[entry.key].push_back(entry.nextToken);
+    });
 }
 
 static bool parseNgramTableLine(const std::string& line, int maxKeyLen, ngram_key* key, int* nextToken, int* count) {
@@ -99,8 +323,11 @@ static int loadNgramTable(ngram_cache<ngram_value>& data, const std::string& pat
     if (path.empty()) {
         return 0;
     }
+    if (isBinaryNgramTable(path)) {
+        return loadBinaryNgramTable(data, path, maxKeyLen);
+    }
     if (hasSuffix(path, ".gz")) {
-        MNN_PRINT("Warning: ngram_table_file only supports plain TSV, not gzip: %s\n", path.c_str());
+        MNN_PRINT("Warning: ngram_table_file only supports plain TSV or binary .bin/.mnnngram, not gzip: %s\n", path.c_str());
         return 0;
     }
     std::ifstream file(path);
@@ -129,8 +356,11 @@ static int loadNgramTable(ngram_cache<ngram_ordered_value>& data, const std::str
     if (path.empty()) {
         return 0;
     }
+    if (isBinaryNgramTable(path)) {
+        return loadBinaryNgramTable(data, path, maxKeyLen);
+    }
     if (hasSuffix(path, ".gz")) {
-        MNN_PRINT("Warning: ngram_table_file only supports plain TSV, not gzip: %s\n", path.c_str());
+        MNN_PRINT("Warning: ngram_table_file only supports plain TSV or binary .bin/.mnnngram, not gzip: %s\n", path.c_str());
         return 0;
     }
     std::ifstream file(path);
