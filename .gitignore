@@ -425,7 +425,7 @@ apps/iOS/MNNLLMChat/swift-transformers/
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-4B-MNN
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-0.6B-MNN
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
-prompts/
+/prompts/
 harmony_agent.py
 
 mobiinfra-oh/
@@ -493,7 +493,8 @@ transformers/llm/export/run_visual_blocks_pipeline.sh
 # into /smoke_sources/, then MNNConvert writes the .caffe.mnn here)
 /resource/model/**/*.caffe.mnn
 
-token_count
+# Root-level local token-count outputs. Keep tools/token_count source tracked.
+/token_count/
 
 # Local experiment artifacts
 artifacts/
