@@ -130,6 +130,92 @@ It also writes:
 
 The target script currently force-keeps a few token ids used by a Taobao prompt formatting case. Those ids are tokenizer-specific. Before using this script on a new tokenizer family, verify or remove that force-keep list in `build_keep()`.
 
+## Existing Token Count Artifacts
+
+The archive currently contains several reusable `token_counts.csv` files under `experiments/token_count_archive/`.
+
+Preferred full JSONL count for the MAI/UI-Venus tokenizer family:
+
+```text
+experiments/token_count_archive/jsonl_token_count_outputs/token_counts.csv
+```
+
+Summary:
+
+- Data: `/temp/csm/Dataset-train/mobimind_e2e_train.jsonl`
+- Tokenizer/model used for counting: `/temp/zhangdelong/models/MAI-UI-2B-0422-instruct-halfpixel-1ep_RLv2_4NPUS_bs128_ds5050_step40`
+- Rows processed: `2,258,630`
+- Total message tokens: `2,464,319,155`
+- Vocab size reported by the counter: `151,669`
+- Used token ids: `14,162`
+- Chat template: enabled
+
+Full parquet prompt count:
+
+```text
+experiments/token_count_archive/outputs/token_counts.csv
+```
+
+Summary:
+
+- Data: `/temp/zhangdelong/data/data-0422-instruct-halfpixel/train.parquet`
+- Tokenizer/model used for counting: `/temp/zhangdelong/models/MAI-UI-2B-0422-instruct-halfpixel-1ep_RLv2_4NPUS_bs128_ds5050_step40`
+- Rows processed: `48,976`
+- Total prompt tokens: `35,037,086`
+- Used token ids: `9,236`
+- Chat template: enabled
+
+Sample-only counts also exist, but should not be used for production pruning:
+
+```text
+experiments/token_count_archive/jsonl_sample_out/token_counts.csv
+experiments/token_count_archive/jsonl_token_count_sample_out/token_counts.csv
+experiments/token_count_archive/sample_out/token_counts.csv
+```
+
+Before reusing a count file for a different model checkpoint, verify tokenizer identity. For example, the following target model has the same tokenizer files as the counting model:
+
+```text
+/home/ma-user/modelarts/user-job-dir/lzz/models/UI-Venus-1.5-2B-0422-reasoning-halfpixel-1ep_RLv2_4NPUS_bs128_ds5050_step100
+```
+
+Verified identical files:
+
+- `tokenizer.json`
+- `vocab.json`
+- `merges.txt`
+- `added_tokens.json`
+- `special_tokens_map.json`
+- `tokenizer_config.json`
+- `chat_template.jinja`
+
+Dry-run command for this model:
+
+```bash
+MODEL_PATH=/home/ma-user/modelarts/user-job-dir/lzz/models/UI-Venus-1.5-2B-0422-reasoning-halfpixel-1ep_RLv2_4NPUS_bs128_ds5050_step100
+COUNTS=experiments/token_count_archive/jsonl_token_count_outputs/token_counts.csv
+OUT=${MODEL_PATH}_vocab_pruned
+
+python tools/token_count/prune_vocab_experiment.py \
+  --model "$MODEL_PATH" \
+  --counts "$COUNTS" \
+  --out "$OUT" \
+  --dry-run
+```
+
+Actual prune command:
+
+```bash
+MODEL_PATH=/home/ma-user/modelarts/user-job-dir/lzz/models/UI-Venus-1.5-2B-0422-reasoning-halfpixel-1ep_RLv2_4NPUS_bs128_ds5050_step100
+COUNTS=experiments/token_count_archive/jsonl_token_count_outputs/token_counts.csv
+OUT=${MODEL_PATH}_vocab_pruned
+
+python tools/token_count/prune_vocab_experiment.py \
+  --model "$MODEL_PATH" \
+  --counts "$COUNTS" \
+  --out "$OUT"
+```
+
 ## Prune Eagle3 Vocabulary
 
 After target vocab pruning, Eagle3 mappings must be rebuilt. Target token ids have changed, so reusing the original Eagle3 `d2t/t2d` is incorrect.
