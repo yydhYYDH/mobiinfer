@@ -62,3 +62,43 @@ Example:
 ```
 
 This means the 8-token key is followed by token `44` 128 times in assistant outputs.
+
+## Remap Token IDs For Vocab-Pruned Models
+
+Use `remap_ngram_token_ids.py` when a model keeps the same tokenizer semantics but changes token ids through a vocab-pruning map such as `old_to_new_token_id.json`.
+
+```bash
+python tools/ngram/remap_ngram_token_ids.py \
+  --input artifacts/lookahead_bench/ngram_trials/assistant_min20_top1_n1_4.tsv \
+  --mapping /temp/csm/autoround_export/UI-Venus-1.5-2B-0422-reasoning-halfpixel-1ep_RLv2_4NPUS_bs128_ds5050_step100_vocab_pruned/old_to_new_token_id.json \
+  --output artifacts/lookahead_bench/ngram_trials/assistant_min20_top1_n1_4_vocab_pruned.tsv \
+  --max-key-len 4 \
+  --min-count 20 \
+  --top-k 1
+```
+
+Rows containing a token id that is not present in the mapping are dropped. Duplicate remapped `(n, key, next_token)` rows are merged by summing counts, then candidates are filtered and ranked per key.
+
+## Experimental Mmap-Direct Hash Binary
+
+`build_mmap_hash_ngram.py` builds an experimental V3 binary format for top1 ngram tables. It stores separate sections for each n and a static hash-bucket index, so a runtime can mmap the file and look up keys directly without first building an `unordered_map`.
+
+```bash
+python tools/ngram/build_mmap_hash_ngram.py \
+  --input artifacts/lookahead_bench/ngram_trials/assistant_min20_top1_n1_4_vocab_pruned.tsv \
+  --output artifacts/lookahead_bench/ngram_trials/assistant_min20_top1_n1_4_vocab_pruned.hash.mnnngram3 \
+  --max-key-len 4 \
+  --load-factor 2.0
+```
+
+Benchmark the Python mmap reader:
+
+```bash
+python tools/ngram/bench_mmap_hash_ngram.py \
+  --binary artifacts/lookahead_bench/ngram_trials/assistant_min20_top1_n1_4_vocab_pruned.hash.mnnngram3 \
+  --queries artifacts/lookahead_bench/ngram_trials/assistant_min20_top1_n1_4_vocab_pruned.tsv \
+  --max-key-len 4 \
+  --lookups 1000000
+```
+
+This V3 prototype is not wired into MNN runtime yet. It is for validating layout size and lookup behavior before adding the C++ loader.
