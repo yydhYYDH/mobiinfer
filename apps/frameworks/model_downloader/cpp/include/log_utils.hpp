@@ -10,6 +10,10 @@
 #include <sstream>
 #include <memory>
 
+#ifdef ERROR
+#undef ERROR
+#endif
+
 namespace mnn::downloader {
 
 // Terminal color constants for colored logging
@@ -54,6 +58,9 @@ public:
     
     // Add formatted error method for printf-style formatting
     static void ErrorFormatted(const char* format, ...);
+    static void ErrorFormatted(const std::string& message) {
+        Error(message);
+    }
     
     // Overloaded error method for const char* (for backward compatibility)
     static void Error(const char* message, const std::string& tag = "");
@@ -96,20 +103,8 @@ private:
 #define LOG_INFO(msg) mnn::downloader::LogUtils::Info(msg)
 #define LOG_WARNING(msg) mnn::downloader::LogUtils::Warning(msg)
 
-// Smart LOG_ERROR macro that automatically chooses the right method based on argument count
-#define LOG_ERROR_1(msg) mnn::downloader::LogUtils::Error(msg)
-#define LOG_ERROR_2(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_3(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_4(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_5(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_6(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_7(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_8(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_9(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-#define LOG_ERROR_10(msg, ...) mnn::downloader::LogUtils::ErrorFormatted(msg, ##__VA_ARGS__)
-
-#define GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, NAME, ...) NAME
-#define LOG_ERROR(...) GET_MACRO(__VA_ARGS__, LOG_ERROR_10, LOG_ERROR_9, LOG_ERROR_8, LOG_ERROR_7, LOG_ERROR_6, LOG_ERROR_5, LOG_ERROR_4, LOG_ERROR_3, LOG_ERROR_2, LOG_ERROR_1)(__VA_ARGS__)
+// Route both string-concatenation and printf-style calls through overloads.
+#define LOG_ERROR(...) mnn::downloader::LogUtils::ErrorFormatted(__VA_ARGS__)
 
 // Special macro for string concatenation cases
 #define LOG_ERROR_STR(msg) mnn::downloader::LogUtils::Error(msg)
