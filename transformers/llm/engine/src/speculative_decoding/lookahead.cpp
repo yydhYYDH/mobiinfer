@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -27,11 +28,6 @@
 using namespace MNN::Express;
 namespace MNN {
 namespace Transformer {
-
-struct LookaheadNgramCache {
-    ngram_cache<ngram_value> freqCache;
-    ngram_cache<ngram_ordered_value> orderedCache;
-};
 
 namespace {
 
@@ -55,6 +51,15 @@ static bool parseInt(const std::string& text, int* value) {
 
 static const uint32_t kNgramBinaryVersion = 2;
 static const char kNgramBinaryMagic[8] = {'M', 'N', 'N', 'N', 'G', 'R', 'M', '2'};
+static const uint32_t kNgramHashBinaryVersion = 3;
+static const uint32_t kNgramHashBinaryFlagsTop1 = 1;
+static const uint64_t kNgramHashSeed = 1469598103934665603ull;
+static const uint64_t kNgramHashPrime = 1099511628211ull;
+static const char kNgramHashBinaryMagic[8] = {'M', 'N', 'N', 'N', 'G', 'R', 'M', '3'};
+
+static bool isMmapHashNgramTable(const std::string& path) {
+    return hasSuffix(path, ".mnnngram3");
+}
 
 static bool isBinaryNgramTable(const std::string& path) {
     return hasSuffix(path, ".bin") || hasSuffix(path, ".mnnngram");
@@ -168,6 +173,231 @@ static bool readI32(const uint8_t*& ptr, const uint8_t* end, int* value) {
     }
     *value = static_cast<int32_t>(raw);
     return true;
+}
+
+
+static bool readU64(const uint8_t*& ptr, const uint8_t* end, uint64_t* value) {
+    if (ptr + sizeof(uint64_t) > end) {
+        return false;
+    }
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= static_cast<uint64_t>(ptr[i]) << (8 * i);
+    }
+    ptr += sizeof(uint64_t);
+    *value = v;
+    return true;
+}
+
+static bool readU32At(const uint8_t* data, size_t size, uint64_t offset, uint32_t* value) {
+    if (offset > size || size - static_cast<size_t>(offset) < sizeof(uint32_t)) {
+        return false;
+    }
+    const uint8_t* ptr = data + static_cast<size_t>(offset);
+    uint32_t v = 0;
+    v |= static_cast<uint32_t>(ptr[0]);
+    v |= static_cast<uint32_t>(ptr[1]) << 8;
+    v |= static_cast<uint32_t>(ptr[2]) << 16;
+    v |= static_cast<uint32_t>(ptr[3]) << 24;
+    *value = v;
+    return true;
+}
+
+static bool readI32At(const uint8_t* data, size_t size, uint64_t offset, int* value) {
+    uint32_t raw = 0;
+    if (!readU32At(data, size, offset, &raw)) {
+        return false;
+    }
+    *value = static_cast<int32_t>(raw);
+    return true;
+}
+
+static uint64_t hashNgramKey(const ngram_key& key, int keyLen) {
+    uint64_t hash = kNgramHashSeed;
+    for (int i = 0; i < keyLen; i++) {
+        hash ^= static_cast<uint32_t>(key.keys[i]);
+        hash *= kNgramHashPrime;
+    }
+    return hash;
+}
+
+class MmapHashNgramTable {
+public:
+    bool load(const std::string& path, int maxKeyLen) {
+        mFile.reset(new ReadOnlyMappedFile(path));
+        if (!mFile->valid()) {
+            mFile.reset();
+            return false;
+        }
+        const uint8_t* ptr = mFile->data();
+        const uint8_t* end = mFile->data() + mFile->size();
+        if (ptr + 40 > end || std::memcmp(ptr, kNgramHashBinaryMagic, sizeof(kNgramHashBinaryMagic)) != 0) {
+            MNN_PRINT("Warning: invalid mmap hash ngram table header: %s\n", path.c_str());
+            mFile.reset();
+            return false;
+        }
+        ptr += sizeof(kNgramHashBinaryMagic);
+        uint32_t version = 0;
+        uint32_t flags = 0;
+        uint32_t storedMaxKeyLen = 0;
+        uint32_t sectionCount = 0;
+        uint32_t descOffset = 0;
+        uint32_t dataOffset = 0;
+        uint32_t hashSeedLow = 0;
+        uint32_t reserved = 0;
+        if (!readU32(ptr, end, &version) || !readU32(ptr, end, &flags) || !readU32(ptr, end, &storedMaxKeyLen) ||
+            !readU32(ptr, end, &sectionCount) || !readU32(ptr, end, &descOffset) || !readU32(ptr, end, &dataOffset) ||
+            !readU32(ptr, end, &hashSeedLow) || !readU32(ptr, end, &reserved)) {
+            mFile.reset();
+            return false;
+        }
+        if (version != kNgramHashBinaryVersion || (flags & kNgramHashBinaryFlagsTop1) == 0 || storedMaxKeyLen == 0 ||
+            storedMaxKeyLen > MNN_NGRAM_KEY_MAX || sectionCount > MNN_NGRAM_KEY_MAX) {
+            MNN_PRINT("Warning: unsupported mmap hash ngram table header: %s\n", path.c_str());
+            mFile.reset();
+            return false;
+        }
+        (void)dataOffset;
+        (void)hashSeedLow;
+        (void)reserved;
+        const size_t sectionStride = 40;
+        if (descOffset > mFile->size() || mFile->size() - descOffset < sectionCount * sectionStride) {
+            mFile.reset();
+            return false;
+        }
+        int loaded = 0;
+        mMaxKeyLen = std::min(static_cast<int>(storedMaxKeyLen), maxKeyLen);
+        for (uint32_t i = 0; i < sectionCount; i++) {
+            const uint8_t* sptr = mFile->data() + descOffset + i * sectionStride;
+            uint32_t n = 0;
+            uint32_t entryCount = 0;
+            uint32_t bucketCount = 0;
+            uint32_t entryStride = 0;
+            uint64_t bucketOffsetsOffset = 0;
+            uint64_t entriesOffset = 0;
+            uint32_t sectionFlags = 0;
+            uint32_t sectionReserved = 0;
+            if (!readU32(sptr, end, &n) || !readU32(sptr, end, &entryCount) || !readU32(sptr, end, &bucketCount) ||
+                !readU32(sptr, end, &entryStride) || !readU64(sptr, end, &bucketOffsetsOffset) ||
+                !readU64(sptr, end, &entriesOffset) || !readU32(sptr, end, &sectionFlags) ||
+                !readU32(sptr, end, &sectionReserved)) {
+                mFile.reset();
+                return false;
+            }
+            (void)sectionFlags;
+            (void)sectionReserved;
+            if (n == 0 || n > static_cast<uint32_t>(mMaxKeyLen) || bucketCount == 0 ||
+                (bucketCount & (bucketCount - 1)) != 0 || entryStride != sizeof(int32_t) * (n + 1)) {
+                continue;
+            }
+            uint64_t offsetsBytes = static_cast<uint64_t>(bucketCount + 1) * sizeof(uint32_t);
+            uint64_t entriesBytes = static_cast<uint64_t>(entryCount) * entryStride;
+            if (bucketOffsetsOffset > mFile->size() || offsetsBytes > mFile->size() - bucketOffsetsOffset ||
+                entriesOffset > mFile->size() || entriesBytes > mFile->size() - entriesOffset) {
+                continue;
+            }
+            Section& section = mSections[n];
+            section.valid = true;
+            section.n = n;
+            section.entryCount = entryCount;
+            section.bucketCount = bucketCount;
+            section.entryStride = entryStride;
+            section.bucketOffsetsOffset = bucketOffsetsOffset;
+            section.entriesOffset = entriesOffset;
+            loaded += entryCount;
+        }
+        if (loaded <= 0) {
+            mFile.reset();
+            return false;
+        }
+        MNN_PRINT("Loaded %d mmap hash ngram table entries from %s\n", loaded, path.c_str());
+        return true;
+    }
+
+    bool lookup(const ngram_key& key, int keyLen, int* nextToken) const {
+        if (!mFile || keyLen <= 0 || keyLen > MNN_NGRAM_KEY_MAX) {
+            return false;
+        }
+        const Section& section = mSections[keyLen];
+        if (!section.valid) {
+            return false;
+        }
+        uint32_t bucket = static_cast<uint32_t>(hashNgramKey(key, keyLen) & (section.bucketCount - 1));
+        uint32_t begin = 0;
+        uint32_t end = 0;
+        uint64_t offsetsPos = section.bucketOffsetsOffset + static_cast<uint64_t>(bucket) * sizeof(uint32_t);
+        if (!readU32At(mFile->data(), mFile->size(), offsetsPos, &begin) ||
+            !readU32At(mFile->data(), mFile->size(), offsetsPos + sizeof(uint32_t), &end) || begin > end ||
+            end > section.entryCount) {
+            return false;
+        }
+        for (uint32_t i = begin; i < end; i++) {
+            uint64_t row = section.entriesOffset + static_cast<uint64_t>(i) * section.entryStride;
+            bool matched = true;
+            for (int j = 0; j < keyLen; j++) {
+                int token = 0;
+                if (!readI32At(mFile->data(), mFile->size(), row + static_cast<uint64_t>(j) * sizeof(int32_t), &token) ||
+                    token != key.keys[j]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) {
+                return readI32At(mFile->data(), mFile->size(), row + static_cast<uint64_t>(keyLen) * sizeof(int32_t),
+                                 nextToken);
+            }
+        }
+        return false;
+    }
+
+private:
+    struct Section {
+        bool valid = false;
+        uint32_t n = 0;
+        uint32_t entryCount = 0;
+        uint32_t bucketCount = 0;
+        uint32_t entryStride = 0;
+        uint64_t bucketOffsetsOffset = 0;
+        uint64_t entriesOffset = 0;
+    };
+
+    std::unique_ptr<ReadOnlyMappedFile> mFile;
+    Section mSections[MNN_NGRAM_KEY_MAX + 1];
+    int mMaxKeyLen = 0;
+};
+
+static void mmapHashNgramSearch(const MmapHashNgramTable& table, int ngramKeyMin, int ngramKeyMax,
+                                const std::vector<int>& tokens, std::vector<int>& drafts, int maxDraftSize) {
+    MNN_ASSERT(drafts.size() == 1);
+    while (drafts.size() < maxDraftSize) {
+        int tokenDraft = -1;
+        for (int ngramKeySize = ngramKeyMax; ngramKeySize >= ngramKeyMin; ngramKeySize--) {
+            int ngramStartIdx = static_cast<int>(tokens.size()) - ngramKeySize + static_cast<int>(drafts.size());
+            ngram_key ngram;
+            int i = ngramStartIdx;
+            if (i < 0) {
+                i = 0;
+            }
+            for (; i < static_cast<int>(tokens.size()); i++) {
+                ngram.keys[i - ngramStartIdx] = tokens[i];
+            }
+            for (; i < ngramStartIdx + ngramKeySize; i++) {
+                ngram.keys[i - ngramStartIdx] = drafts[i - static_cast<int>(tokens.size())];
+            }
+            if (table.lookup(ngram, ngramKeySize, &tokenDraft)) {
+                break;
+            }
+        }
+        if (tokenDraft == -1) {
+            break;
+        }
+        drafts.push_back(tokenDraft);
+    }
+    if (drafts.size() > 1) {
+        for (int i = static_cast<int>(drafts.size()); i < maxDraftSize; i++) {
+            drafts.push_back(0);
+        }
+    }
 }
 
 struct BinaryNgramEntry {
@@ -387,6 +617,13 @@ static int loadNgramTable(ngram_cache<ngram_ordered_value>& data, const std::str
 
 } // namespace
 
+
+struct LookaheadNgramCache {
+    ngram_cache<ngram_value> freqCache;
+    ngram_cache<ngram_ordered_value> orderedCache;
+    std::unique_ptr<MmapHashNgramTable> mmapHashCache;
+};
+
 LookaheadGeneration::LookaheadGeneration(Llm* llm, std::shared_ptr<LlmContext> context,
                                          std::shared_ptr<LlmConfig> config)
     : Generation(llm, context) {
@@ -419,7 +656,14 @@ LookaheadGeneration::LookaheadGeneration(Llm* llm, std::shared_ptr<LlmContext> c
 
     auto ngramTableFile = config->ngram_table_file();
     mPrebuiltNgram.reset(new LookaheadNgramCache);
-    if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+    if (isMmapHashNgramTable(ngramTableFile)) {
+        if (mSelectRule == NgramSelectRule::FCFS_RULE) {
+            mPrebuiltNgram->mmapHashCache.reset(new MmapHashNgramTable);
+            mHasPrebuiltNgram = mPrebuiltNgram->mmapHashCache->load(ngramTableFile, mNgramKeyMaxLen);
+        } else {
+            MNN_PRINT("Warning: mmap hash ngram table only supports fcfs/top1 lookup: %s\n", ngramTableFile.c_str());
+        }
+    } else if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
         mHasPrebuiltNgram = loadNgramTable(mPrebuiltNgram->freqCache, ngramTableFile, mNgramKeyMaxLen) > 0;
     } else {
         mHasPrebuiltNgram = loadNgramTable(mPrebuiltNgram->orderedCache, ngramTableFile, mNgramKeyMaxLen) > 0;
@@ -522,7 +766,10 @@ void LookaheadGeneration::generate(GenerationParams& param) {
                 level = MatchStrictLevel::HIGH_LEVEL;
             }
             // generate draft tokens
-            if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
+            if (mHasPrebuiltNgram && mPrebuiltNgram->mmapHashCache) {
+                mmapHashNgramSearch(*mPrebuiltNgram->mmapHashCache, 1, mNgramKeyMaxLen, mContext->history_tokens,
+                                    drafts, verify_len);
+            } else if (mSelectRule == NgramSelectRule::FreqxLen_RULE) {
                 ngram_cache_search(*activeNgramCache, 1, mNgramKeyMaxLen, mContext->history_tokens, drafts, verify_len,
                                    level);
             } else {
