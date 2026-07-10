@@ -194,6 +194,11 @@ private:
 };
 
 int main(int argc, const char* argv[]) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
     mnncli::UserInterface::ShowWelcome();
     
     CommandLineInterface cli;

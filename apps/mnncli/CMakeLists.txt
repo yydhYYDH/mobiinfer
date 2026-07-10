@@ -1,10 +1,16 @@
 cmake_minimum_required(VERSION 3.6)
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
 project(mnncli VERSION 1.0.0 LANGUAGES CXX C ASM)
 
 # C/C++ standards
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 # set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS version" FORCE)
 
 
@@ -24,7 +30,18 @@ if(APPLE)
     message(STATUS "  SSL: ${OPENSSL_SSL_LIBRARY}")
     message(STATUS "  Crypto: ${OPENSSL_CRYPTO_LIBRARY}")
 else()
+    if(WIN32 AND OPENSSL_ROOT_DIR)
+        set(OPENSSL_SSL_LIBRARY "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT/libssl_static.lib" CACHE FILEPATH "OpenSSL SSL library" FORCE)
+        set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT/libcrypto_static.lib" CACHE FILEPATH "OpenSSL Crypto library" FORCE)
+    endif()
     find_package(OpenSSL REQUIRED)
+    if(WIN32 AND OPENSSL_ROOT_DIR)
+        set(MNNCLI_OPENSSL_LIBRARIES
+            "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT/libssl_static.lib"
+            "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT/libcrypto_static.lib")
+    else()
+        set(MNNCLI_OPENSSL_LIBRARIES ${OPENSSL_LIBRARIES})
+    endif()
 endif()
 
 # Use httplib from MNN transformers directory instead of fetching it
@@ -111,6 +128,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Android")
 endif()
 
 add_executable(mnncli ${MNNCLI_SOURCES})
+if(MSVC)
+    target_compile_options(mnncli PRIVATE /EHsc)
+endif()
 
 target_include_directories(mnncli PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
@@ -153,7 +173,11 @@ if(OpenSSL_FOUND)
     target_compile_definitions(mnncli PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
     
     # Link OpenSSL static libraries - they were already configured as static at the beginning
-    target_link_libraries(mnncli PRIVATE ${OPENSSL_LIBRARIES})
+    if(DEFINED MNNCLI_OPENSSL_LIBRARIES)
+        target_link_libraries(mnncli PRIVATE ${MNNCLI_OPENSSL_LIBRARIES})
+    else()
+        target_link_libraries(mnncli PRIVATE ${OPENSSL_LIBRARIES})
+    endif()
 endif()
 
 # Disable exceptions in httplib since MNN is compiled with -fno-exceptions

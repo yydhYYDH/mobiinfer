@@ -76,7 +76,7 @@ Tokenizer* Tokenizer::createTokenizer(const std::string& filename) {
     // AUTOTIME;
     Tokenizer* tokenizer = nullptr;
     // check file
-    std::ifstream tok_file(filename);
+    std::ifstream tok_file(filename, std::ios::binary);
     if (!tok_file.good()) {
         printf("Failed: can't load tokenzier from: %s.\n", filename.c_str());
         return tokenizer;
@@ -97,12 +97,8 @@ Tokenizer* Tokenizer::createTokenizer(const std::string& filename) {
         auto* pt = new PipelineTokenizer();
         tokenizer = pt;
         tokenizer->load_special(tok_file);
-        auto pos = tok_file.tellg();
+        pt->load_vocab_binary(tok_file);
         tok_file.close();
-        std::ifstream bin_file(filename, std::ios::binary);
-        bin_file.seekg(pos);
-        pt->load_vocab_binary(bin_file);
-        bin_file.close();
         tokenizer->cache_special_tokens();
         return tokenizer;
     }
