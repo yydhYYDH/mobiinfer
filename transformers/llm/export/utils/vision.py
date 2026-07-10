@@ -267,11 +267,17 @@ class Qwen2Vision(Vision):
         super().__init__(visual, base)
         self.quant_bit = 4
 
+    def refresh_image_resize_config(self):
+        self.llm_config['image_size_unit'] = self.patch_size * self.merge_size
+        self.llm_config['image_min_pixels'] = self.min_pixels
+        self.llm_config['image_max_pixels'] = self.max_pixels
+
     def load(self):
         self.vision_start_id = self.config.vision_start_token_id
         self.vision_end_id = self.config.vision_end_token_id
         self.image_pad_id = self.config.image_token_id
         self.llm_config['image_size'] = self.image_height
+        self.refresh_image_resize_config()
         self.llm_config['vision_start'] = self.vision_start_id
         self.llm_config['vision_end'] = self.vision_end_id
         self.llm_config['image_pad'] = self.image_pad_id
@@ -365,7 +371,7 @@ class Qwen2Vision(Vision):
                 h_index = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
                 w_index = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
                 position_ids_list.append(torch.stack([t_index, h_index, w_index]) + cur_idx)
-                cur_idx += w
+                cur_idx += max(h, w)
                 vision_idx += 1
         if txt_len > 0:
             text_index = torch.arange(cur_idx, cur_idx + txt_len, dtype=torch.int)
@@ -409,8 +415,6 @@ class Qwen2Vision(Vision):
         _, channel, height, width = patches.shape
         grid_t = patches.shape[0] // self.temporal_patch_size
         grid_h, grid_w = height // self.patch_size, width // self.patch_size
-        print(f"grid_t: {grid_t}, temporal_patch_size: {self.temporal_patch_size}, channel: {channel}")
-        print(f"grid_h: {grid_h}, merge_size: {self.merge_size}, grid_w: {grid_w}, patch_size: {self.patch_size}")
         patches = patches.reshape(
             grid_t,
             self.temporal_patch_size,
@@ -480,10 +484,7 @@ class Qwen2Vision(Vision):
         )
         image = convert_to_rgb(image)
         image = to_numpy_array(image)
-        height, width = image.shape[0], image.shape[1]
-        print(f"[Qwen2Vision.img_process] image size w h: {width}x{height}")
         resized_height, resized_width = self.smart_resize(self.image_height, self.image_width, self.patch_size * self.merge_size, self.min_pixels, self.max_pixels)
-        print(f"[Qwen2Vision.img_process] image resize w h: {resized_width}x{resized_height}")
         format = infer_channel_dimension_format(image)
         resample = PILImageResampling.BICUBIC
         image = resize(image, size=(resized_height, resized_width), resample=resample, input_data_format=format)
@@ -1002,6 +1003,7 @@ class Qwen3Vision(Qwen2Vision):
 
         self.min_pixels = 65536
         self.max_pixels = 16777216
+        self.refresh_image_resize_config()
         self.merge_unit = self.merge_size * self.merge_size
         self.deepstack_visual_indexes = visual.deepstack_visual_indexes
         self.num_grid_per_side = visual.num_grid_per_side
@@ -1179,13 +1181,6 @@ class Qwen3Vision(Qwen2Vision):
         idx_tensor, weight_tensor = self.get_idx_weight(grid_thw)
         position_ids = self.vision_position_ids(grid_thw)
         attention_mask = self.vision_attention_mask(grid_thw)
-        
-        print(f"flatten_patches.shape: {flatten_patches.shape}")
-        print(f"grid_thw.shape: {grid_thw.shape}")
-        print(f"idx_tensor.shape: {idx_tensor.shape}")
-        print(f"weight_tensor.shape: {weight_tensor.shape}")
-        print(f"position_ids.shape: {position_ids.shape}")
-        print(f"attention_mask.shape: {attention_mask.shape}")
         image_embeds, deepstack_feature = self.forward(flatten_patches, position_ids, attention_mask, idx_tensor, weight_tensor)
         self.deepstack_feature_list.append(deepstack_feature)
         return image_embeds
@@ -1209,32 +1204,6 @@ class Qwen3Vision(Qwen2Vision):
                 - image_embeds: Final image embeddings after processing
                 - deepstack_feature: Stacked deepstack features from specified layers
         """
-        log_path = "qwen3vision_python.log"
-        try:
-            prev_printopts = torch.get_printoptions()
-        except AttributeError:
-            # Older torch versions keep print options in torch._tensor_str.
-            prev_printopts = torch._tensor_str.get_printoptions()
-        # torch.set_printoptions(profile="full")
-        # try:
-        #     with open(log_path, "a", encoding="utf-8") as log_file:
-        #         log_file.write("[Qwen3Vision.forward] flatten_patches:\n")
-        #         log_file.write(f"  shape={tuple(flatten_patches.shape)} dtype={flatten_patches.dtype}\n")
-        #         # log_file.write(repr(flatten_patches) + "\n")
-        #         log_file.write("[Qwen3Vision.forward] position_ids:\n")
-        #         log_file.write(f"  shape={tuple(position_ids.shape)} dtype={position_ids.dtype}\n")
-        #         # log_file.write(repr(position_ids) + "\n")
-        #         log_file.write("[Qwen3Vision.forward] attention_mask:\n")
-        #         log_file.write(f"  shape={tuple(attention_mask.shape)} dtype={attention_mask.dtype}\n")
-        #         # log_file.write(repr(attention_mask) + "\n")
-        #         log_file.write("[Qwen3Vision.forward] idx_tensor:\n")
-        #         log_file.write(f"  shape={tuple(idx_tensor.shape)} dtype={idx_tensor.dtype}\n")
-        #         # log_file.write(repr(idx_tensor) + "\n")
-        #         log_file.write("[Qwen3Vision.forward] weight_tensor:\n")
-        #         log_file.write(f"  shape={tuple(weight_tensor.shape)} dtype={weight_tensor.dtype}\n")
-        #         # log_file.write(repr(weight_tensor) + "\n")
-        # finally:
-        #     torch.set_printoptions(**prev_printopts)
         rotary_pos_emb = self.rotary(position_ids)
         # --- 修改点 2: 使用线性层处理输入 ---
         # 无论输入是 5D [B,3,2,16,16] 还是 2D [B,1536]，view 都能将其安全转为 2D
