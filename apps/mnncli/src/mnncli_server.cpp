@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <vector>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 namespace mnncli {
 
@@ -107,11 +109,24 @@ std::string SanitizePathPart(const std::string& value) {
 }
 
 bool EnsureDirectory(const std::string& path) {
-    struct stat st {};
-    if (stat(path.c_str(), &st) == 0) {
-        return S_ISDIR(st.st_mode);
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        return true;
     }
-    return mkdir(path.c_str(), 0755) == 0;
+    return std::filesystem::create_directories(path, ec) || std::filesystem::is_directory(path, ec);
+}
+
+std::string ImageCacheDirectory() {
+    std::error_code ec;
+    auto temp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec || temp_dir.empty()) {
+#ifdef _WIN32
+        temp_dir = ".";
+#else
+        temp_dir = "/tmp";
+#endif
+    }
+    return (temp_dir / "mnncli_openai_images").string();
 }
 
 bool WriteFile(const std::string& path, const std::vector<uint8_t>& data) {
@@ -134,7 +149,7 @@ std::string SaveImageUrlToTempFile(const std::string& url, size_t image_index, s
         error = "Failed to decode base64 image_url.";
         return "";
     }
-    std::string dir = "/tmp/mnncli_openai_images";
+    std::string dir = ImageCacheDirectory();
     if (!EnsureDirectory(dir)) {
         error = "Failed to create image cache directory: " + dir;
         return "";
@@ -151,7 +166,8 @@ std::string SaveImageUrlToTempFile(const std::string& url, size_t image_index, s
         }
     }
     std::ostringstream path;
-    path << dir << "/img_" << GetCurrentTimeNanosAsString() << "_" << image_index << "." << extension;
+    path << (std::filesystem::path(dir) /
+             ("img_" + GetCurrentTimeNanosAsString() + "_" + std::to_string(image_index) + "." + extension)).string();
     if (!WriteFile(path.str(), image_bytes)) {
         error = "Failed to write decoded image to: " + path.str();
         return "";
@@ -485,11 +501,17 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
         AllowCors(res);
         res.set_content(html_content, "text/html");
     });
+
+    server.Get("/health", [](const httplib::Request& /*req*/, httplib::Response& res) {
+      AllowCors(res);
+      res.set_content("{\"status\":\"ok\"}", "application/json; charset=utf-8");
+    });
+
     server.Post("/reset", [&](const httplib::Request &req, httplib::Response &res) {
       LOG_DEBUG("POST /reset");
       AllowCors(res);
       llm->reset();
-      res.set_content("{\"status\": \"ok\"}", "application/json");
+      res.set_content("{\"status\": \"ok\"}", "application/json; charset=utf-8");
     });
     
     server.Get("/v1/models", [&](const httplib::Request &req, httplib::Response &res) {
@@ -506,7 +528,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
           }
         })}
       };
-      res.set_content(models_response.dump(), "application/json");
+      res.set_content(models_response.dump(), "application/json; charset=utf-8");
     });
     server.Options("/v1/models", [](const httplib::Request& /*req*/, httplib::Response& res) {
         AllowCors(res);
@@ -530,7 +552,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
           json err;
           err["error"] = "Invalid JSON in request body.";
           res.status = 400;
-          res.set_content(err.dump(), "application/json");
+          res.set_content(err.dump(), "application/json; charset=utf-8");
           return;
       }
       json request_json = json::parse(req.body, nullptr, false);
@@ -620,7 +642,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
           json err;
           err["error"] = "Invalid JSON in request body.";
           res.status = 400;
-          res.set_content(err.dump(), "application/json");
+          res.set_content(err.dump(), "application/json; charset=utf-8");
           return;
       }
 
