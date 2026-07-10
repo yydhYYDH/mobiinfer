@@ -371,21 +371,59 @@ void RunLlmResponse(MNN::Transformer::Llm* llm,
     llm->response(prompts, &output_ostream, end_with);
 }
 
-void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result) {
+double TokensPerSecond(int tokens, double milliseconds) {
+    if (tokens <= 0 || milliseconds <= 0.0) {
+        return 0.0;
+    }
+    return 1000.0 * static_cast<double>(tokens) / milliseconds;
+}
+
+json BuildTimingsJson(MNN::Transformer::Llm* llm) {
+    const auto* context = llm ? llm->getContext() : nullptr;
+    if (context == nullptr) {
+        return json::object();
+    }
+    const int prompt_tokens = context->prompt_len;
+    const int predicted_tokens = context->gen_seq_len;
+    const double prompt_ms =
+        static_cast<double>(context->prefill_us + context->vision_us + context->audio_us) / 1000.0;
+    const double predicted_ms = static_cast<double>(context->decode_us) / 1000.0;
+
+    return {
+        {"cache_n", 0},
+        {"prompt_n", prompt_tokens},
+        {"prompt_ms", prompt_ms},
+        {"prompt_per_token_ms", prompt_tokens > 0 ? prompt_ms / prompt_tokens : 0.0},
+        {"prompt_per_second", TokensPerSecond(prompt_tokens, prompt_ms)},
+        {"predicted_n", predicted_tokens},
+        {"predicted_ms", predicted_ms},
+        {"predicted_per_token_ms", predicted_tokens > 0 ? predicted_ms / predicted_tokens : 0.0},
+        {"predicted_per_second", TokensPerSecond(predicted_tokens, predicted_ms)}
+    };
+}
+
+json BuildUsageJson(const json& timings) {
+    const int prompt_tokens = timings.value("prompt_n", 0);
+    const int completion_tokens = timings.value("predicted_n", 0);
+    return {
+        {"prompt_tokens", prompt_tokens},
+        {"completion_tokens", completion_tokens},
+        {"total_tokens", prompt_tokens + completion_tokens}
+    };
+}
+
+void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&, const json&)> on_result) {
   ParsedMessages parsed = ParseOpenAiMessages(messages);
   if (!parsed.ok) {
     LOG_DEBUG("Error parsing OpenAI messages: " + parsed.error);
-    on_result("error: " + parsed.error);
+    on_result("error: " + parsed.error, json());
     return;
   }
   std::stringstream response_buffer;
-  Utf8StreamProcessor processor([&response_buffer, on_result](const std::string& utf8Char) {
+  Utf8StreamProcessor processor([&response_buffer](const std::string& utf8Char) {
     bool is_eop = utf8Char.find("<eop>") != std::string::npos;
     if (!is_eop) {
         response_buffer << utf8Char;
-    } else {
-        std::string response_result =  response_buffer.str();
-        on_result(response_result);
     }
     }
   );
@@ -394,16 +432,17 @@ void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std:
   }};
   std::ostream output_ostream(&stream_buffer);std::lock_guard<std::mutex> lock(llm_mutex_);
   RunLlmResponse(llm, this->is_r1_, parsed, output_ostream, "<eop>");
+  on_result(response_buffer.str(), BuildTimingsJson(llm));
 }
 
 void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
                      const json& messages,
-                     std::function<void(const std::string&, bool end)> on_partial) {
+                     std::function<void(const std::string&, bool end, const json&)> on_partial) {
     ParsedMessages parsed = ParseOpenAiMessages(messages);
     if (!parsed.ok) {
         LOG_DEBUG("Error parsing OpenAI messages: " + parsed.error);
-        on_partial("error: " + parsed.error, false);
-        on_partial("", true);
+        on_partial("error: " + parsed.error, false, json());
+        on_partial("", true, json());
         return;
     }
     std::string answer = "";
@@ -412,10 +451,9 @@ void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
         if (is_eop) {
             std::string response_result = answer;
             LOG_DEBUG("response result: " + response_result);
-            on_partial("", true);
         } else {
             answer += utf8Char;
-            on_partial(utf8Char, false);
+            on_partial(utf8Char, false, json());
         }
     });
 
@@ -426,6 +464,7 @@ void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
     std::ostream output_ostream(&stream_buffer);
     std::lock_guard<std::mutex> lock(llm_mutex_);
     RunLlmResponse(llm, this->is_r1_, parsed, output_ostream, "<eop>");
+    on_partial("", true, BuildTimingsJson(llm));
 }
 
 
@@ -500,7 +539,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
       std::string model = request_json.value("model", "undefined-model");
       bool stream = request_json.value("stream", false);
       if (!stream) {
-          Answer(llm, messages, [&res, model](const std::string& answer) {
+          Answer(llm, messages, [&res, model](const std::string& answer, const json& timings) {
               json response_json = {
               {"id", "chatcmpl" + GetCurrentTimeAsString()},
               {"object", "chat.completion"},
@@ -521,14 +560,13 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
                 })
               },
               {
-                "usage", {
-                  {"prompt_tokens", 10},
-                  {"completion_tokens", 7},
-                  {"total_tokens", 17}
-                }
+                "usage", BuildUsageJson(timings)
               }
             };
-            res.set_content(response_json.dump(), "application/json");
+            if (!timings.is_null() && !timings.empty()) {
+                response_json["timings"] = timings;
+            }
+            res.set_content(response_json.dump(), "application/json; charset=utf-8");
           });
           return;
       }
@@ -538,7 +576,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
       res.set_chunked_content_provider(
             "text/event-stream",
             [llm, messages, model, this](size_t /*offset*/, httplib::DataSink &sink) {
-                auto sse_callback = [&, this](const std::string &partial_text, bool end) {
+                auto sse_callback = [&, this](const std::string &partial_text, bool end, const json& timings) {
                     std::string finish_reason = end ? "stop" : "";
                     json sse_json = {
                         {"id",       "chatcmpl-" + GetCurrentTimeAsString()},
@@ -553,6 +591,10 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
                             }
                         })}
                     };
+                    if (end && !timings.is_null() && !timings.empty()) {
+                        sse_json["timings"] = timings;
+                        sse_json["usage"] = BuildUsageJson(timings);
+                    }
                     std::string chunk_str = "data: " + sse_json.dump() + "\n\n";
                     sink.os.write(chunk_str.c_str(), chunk_str.size());
                     sink.os.flush();
@@ -588,7 +630,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
       bool stream = request_json.value("stream", false);
 
       if (!stream) {
-          Answer(llm, messages, [&res, model](const std::string& answer) {
+          Answer(llm, messages, [&res, model](const std::string& answer, const json& timings) {
               json response_json = {
                   {"id", "msg_" + GetCurrentTimeAsString()},
                   {"type", "message"},
@@ -603,11 +645,14 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
                   {"stop_reason", "end_turn"},
                   {"stop_sequence", nullptr},
                   {"usage", {
-                      {"input_tokens", 0},
-                      {"output_tokens", 0}
+                      {"input_tokens", timings.value("prompt_n", 0)},
+                      {"output_tokens", timings.value("predicted_n", 0)}
                   }}
               };
-              res.set_content(response_json.dump(), "application/json");
+              if (!timings.is_null() && !timings.empty()) {
+                  response_json["timings"] = timings;
+              }
+              res.set_content(response_json.dump(), "application/json; charset=utf-8");
           });
           return;
       }
@@ -644,8 +689,10 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
               });
 
               int output_tokens = 0;
-              auto anthropic_sse_callback = [&](const std::string &partial_text, bool end) {
+              json final_timings = json();
+              auto anthropic_sse_callback = [&](const std::string &partial_text, bool end, const json& timings) {
                   if (end) {
+                      final_timings = timings;
                       return;
                   }
                   if (!partial_text.empty()) {
@@ -673,15 +720,22 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
                   {"delta", {
                       {"stop_reason", "end_turn"},
                       {"stop_sequence", nullptr}
-                  }},
-                  {"usage", {
-                      {"input_tokens", 0},
-                      {"output_tokens", output_tokens}
-                  }}
-              });
+	                  }},
+	                  {"usage", {
+	                      {"input_tokens", final_timings.value("prompt_n", 0)},
+	                      {"output_tokens", final_timings.value("predicted_n", output_tokens)}
+	                  }}
+	              });
 
-              SendSseEvent(sink, "message_stop", {
-                  {"type", "message_stop"}
+              if (!final_timings.is_null() && !final_timings.empty()) {
+                  SendSseEvent(sink, "mnn_timings", {
+                      {"type", "mnn_timings"},
+                      {"timings", final_timings}
+                  });
+              }
+
+	              SendSseEvent(sink, "message_stop", {
+	                  {"type", "message_stop"}
               });
 
               sink.done();
