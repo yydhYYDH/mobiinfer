@@ -222,7 +222,7 @@ int main(int argc, const char* argv[]) {
         MNN_ERROR("createLLM failed\n");
         return 1;
     }
-    llm->set_config(R"({"async":false,"kvcache_mmap":true})");
+    llm->set_config(R"({"async":false,"kvcache_mmap":true,"tmp_path":"tmp"})");
     {
         AUTOTIME;
         bool res = llm->load();

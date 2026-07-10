@@ -191,7 +191,7 @@ void CPUKVCacheManager::moveKVCacheFromMemToDisk(int oldMaxLength) {
 /*
 **  @brief  Expand the size of kvcache files in disk
 */
-void CPUKVCacheManager::expandKVCacheInDisk(size_t oldMaxLength, size_t oldKeySize, size_t oldValueSize, size_t keySize,
+bool CPUKVCacheManager::expandKVCacheInDisk(size_t oldMaxLength, size_t oldKeySize, size_t oldValueSize, size_t keySize,
                                             size_t valueSize, file_t specKeyFile, file_t specValueFile) {
     // Step 1: Copy the old kvcache from files to temporary buffers in memory
     auto prevKeySizePerHead = oldKeySize / mKvNumHead;
@@ -214,12 +214,24 @@ void CPUKVCacheManager::expandKVCacheInDisk(size_t oldMaxLength, size_t oldKeySi
         memset(prevValue->host<uint8_t>(), 0, prevValue->length(0) * prevValue->stride(0));
     }
     mmapKVCache(oldKeySize, oldValueSize, specKeyFile, specValueFile);
+    if (mMapKeyAddr == nullptr || mMapValueAddr == nullptr) {
+        MNN_ERROR("Failed to mmap old disk kvcache when expanding.\n");
+        mBackend->onReleaseBuffer(prevKey.get(), Backend::STATIC);
+        mBackend->onReleaseBuffer(prevValue.get(), Backend::STATIC);
+        return false;
+    }
     memcpy(prevKey->host<int8_t>(),   mMapKeyAddr,   oldKeySize);
     memcpy(prevValue->host<int8_t>(), mMapValueAddr, oldValueSize);
     // Step 2: Resize the kvcache files and remap them
     unmapKVCache(oldKeySize, oldValueSize);
     resetKVCacheFileSize(keySize, valueSize);
     mmapKVCache(keySize, valueSize);
+    if (mMapKeyAddr == nullptr || mMapValueAddr == nullptr) {
+        MNN_ERROR("Failed to mmap resized disk kvcache when expanding.\n");
+        mBackend->onReleaseBuffer(prevKey.get(), Backend::STATIC);
+        mBackend->onReleaseBuffer(prevValue.get(), Backend::STATIC);
+        return false;
+    }
     // Step 3: Move the kvcache from temporary buffers in memory to disk
     memset(mMapKeyAddr, 0, keySize);
     memset(mMapValueAddr, 0, valueSize);
@@ -280,6 +292,7 @@ void CPUKVCacheManager::expandKVCacheInDisk(size_t oldMaxLength, size_t oldKeySi
     // Step 4: Release the temporary buffers
     mBackend->onReleaseBuffer(prevKey.get(), Backend::STATIC);
     mBackend->onReleaseBuffer(prevValue.get(), Backend::STATIC);
+    return true;
 }
 
 void CPUKVCacheManager::onResize(int kv_num_head, int head_dim) {
@@ -308,8 +321,8 @@ void CPUKVCacheManager::onAlloc(KVMeta* meta, int seq_len) {
         std::string pathk    = MNNFilePathConcat(mConfig.mPrefixCacheDir, mMeta->file_name) + "_" + std::to_string(mMeta->layer_index) + ".k";
         std::string pathv    = MNNFilePathConcat(mConfig.mPrefixCacheDir, mMeta->file_name) + "_" + std::to_string(mMeta->layer_index++) + ".v";
         mMeta->layer_index = mMeta->layer_index % mMeta->layer_nums;
-        auto old_key_fd   = MNNOpenFile(pathk.c_str(), MNN_FILE_WRITE);
-        auto old_value_fd = MNNOpenFile(pathv.c_str(), MNN_FILE_WRITE);
+        auto old_key_fd   = MNNOpenFile(pathk.c_str(), MNN_FILE_READ | MNN_FILE_WRITE);
+        auto old_value_fd = MNNOpenFile(pathv.c_str(), MNN_FILE_READ | MNN_FILE_WRITE);
         if (old_key_fd == INVALID_FILE) {
             MNN_PRINT("Failed to open the file: %s\n", pathk.c_str());
         }
@@ -372,7 +385,17 @@ void CPUKVCacheManager::onAlloc(KVMeta* meta, int seq_len) {
 
         createKVCacheFile();
         resetKVCacheFileSize(keySize, valueSize);
-        expandKVCacheInDisk(oldMaxLength, oldKeySize, oldValueSize, keySize, valueSize, old_key_fd, old_value_fd);
+        if (mKeyCacheFD == INVALID_FILE || mValueCacheFD == INVALID_FILE) {
+            MNN_ERROR("Failed to create disk kvcache file for prefix load.\n");
+            MNNCloseFile(old_key_fd);
+            MNNCloseFile(old_value_fd);
+            return;
+        }
+        if (!expandKVCacheInDisk(oldMaxLength, oldKeySize, oldValueSize, keySize, valueSize, old_key_fd, old_value_fd)) {
+            MNNCloseFile(old_key_fd);
+            MNNCloseFile(old_value_fd);
+            return;
+        }
         mPastLength = meta->seqlen_in_disk;
         mKVCacheInDisk = true;
 
@@ -515,7 +538,9 @@ void CPUKVCacheManager::onRealloc(KVMeta* meta) {
         if (mKVCacheInDisk == false) {
             expandKVCacheInMem(oldMaxLength);
         } else {
-            expandKVCacheInDisk(oldMaxLength, oldKeySize, oldValueSize, keySize, valueSize);
+            if (!expandKVCacheInDisk(oldMaxLength, oldKeySize, oldValueSize, keySize, valueSize)) {
+                return;
+            }
         }
         /* No matter where is the kvcache, the scales and zero points are always in memory, since their size is very small */
         if (mKeyQuantMode == KVQuantMode::Int8) {
