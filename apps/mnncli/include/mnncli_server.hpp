@@ -621,10 +621,10 @@ class MnncliServer {
     void Start(MNN::Transformer::Llm* llm, bool is_r1, const std::string& host = "127.0.0.1", int port = 8000);
     bool is_r1_{false};
 private:
-  void Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result);
+  void Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&, const json&)> on_result);
   void AnswerStreaming(MNN::Transformer::Llm* llm,
                      const json& messages,
-                     std::function<void(const std::string&, bool end)> on_partial);
+                     std::function<void(const std::string&, bool end, const json&)> on_partial);
     std::mutex llm_mutex_;
 
 };
