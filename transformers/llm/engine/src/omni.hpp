@@ -221,6 +221,11 @@ private:
     std::vector<bool> mChunkUseOm;               // per-chunk: true → OM, false → MNN Module
     std::set<int> mOmDeepstackDupIndices;        // chunk indices where OM output[0] → deepstack
     std::shared_ptr<Executor::RuntimeManager> mVisionBlocksRuntimeManager;
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+    std::string mVisualChunkDumpDir;
+    int mVisualChunkDumpMaxSamples = 0;
+    int mVisualChunkDumpedSamples = 0;
+#endif
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;
     int64_t mThinkerElapsedUs = 0;

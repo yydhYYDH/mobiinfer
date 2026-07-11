@@ -17,6 +17,11 @@
 #include <iomanip>
 #include <sstream>
 #include <cstdlib>
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 #include <MNN/Interpreter.hpp>
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
@@ -240,6 +245,8 @@ static VARP qwen3PillowLikeResize(VARP image, int outW, int outH) {
 #define VISUAL_CHUNK_DUMP_OUTPUT 0
 #endif
 
+// Opt-in dump for real visual block chunk inputs used to build HiAI OM calibration data.
+
 namespace {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 static constexpr bool kIsX86 = true;
@@ -338,6 +345,66 @@ static std::string varShapeString(const VARP& v) {
     }
     return oss.str();
 }
+
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+static bool visualChunkDumpEnsureDir(const std::string& dir) {
+    if (dir.empty()) {
+        return false;
+    }
+    auto makeOne = [](const std::string& path) {
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0) {
+            return S_ISDIR(st.st_mode);
+        }
+        return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+    };
+    std::string cur;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        cur.push_back(dir[i]);
+        if (dir[i] == '/' && cur.size() > 1) {
+            if (!makeOne(cur)) {
+                return false;
+            }
+        }
+    }
+    if (!makeOne(dir)) {
+        return false;
+    }
+    struct stat st;
+    return stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool visualChunkDumpVarp(const std::string& base, VARP var, std::vector<int>& outShape) {
+    outShape.clear();
+    if (var.get() == nullptr || var->getInfo() == nullptr) {
+        MNN_ERROR("[visual-dump] %s: null var\n", base.c_str());
+        return false;
+    }
+    VARP readVar = var;
+    auto info = var->getInfo();
+    if (!(info->type.code == halide_type_float && info->type.bits == 32)) {
+        readVar = _Cast(var, halide_type_of<float>());
+    }
+    auto readInfo = readVar->getInfo();
+    if (readInfo == nullptr) {
+        MNN_ERROR("[visual-dump] %s: no readable info\n", base.c_str());
+        return false;
+    }
+    auto ptr = readVar->readMap<float>();
+    if (ptr == nullptr) {
+        MNN_ERROR("[visual-dump] %s: null host ptr\n", base.c_str());
+        return false;
+    }
+    std::ofstream ofs(base + ".bin", std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) {
+        MNN_ERROR("[visual-dump] cannot open %s.bin\n", base.c_str());
+        return false;
+    }
+    ofs.write(reinterpret_cast<const char*>(ptr), static_cast<size_t>(readInfo->size) * sizeof(float));
+    outShape.assign(readInfo->dim.begin(), readInfo->dim.end());
+    return true;
+}
+#endif
 
 static VARP makeHostBridgeVar(const VARP& src, const char* name) {
     if (src.get() == nullptr || src->getInfo() == nullptr) return src;
@@ -659,6 +726,25 @@ bool Omni::load() {
                 if (!npuCacheBaseDir.empty()) {
                     mVisionBlocksRuntimeManager->setExternalPath(
                         npuCacheBaseDir, MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
+                }
+#endif
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+                if (mConfig->config_.contains("visual_chunk_input_dump_dir")) {
+                    mVisualChunkDumpDir = mConfig->config_.value("visual_chunk_input_dump_dir", std::string());
+                }
+                if (mConfig->config_.contains("visual_chunk_input_dump_samples")) {
+                    mVisualChunkDumpMaxSamples = mConfig->config_.value("visual_chunk_input_dump_samples", 0);
+                }
+                if (!mVisualChunkDumpDir.empty() && mVisualChunkDumpMaxSamples > 0) {
+                    if (!visualChunkDumpEnsureDir(mVisualChunkDumpDir)) {
+                        MNN_ERROR("[visual-dump] cannot create dump dir %s, dumping disabled\n",
+                                  mVisualChunkDumpDir.c_str());
+                        mVisualChunkDumpDir.clear();
+                        mVisualChunkDumpMaxSamples = 0;
+                    } else {
+                        MNN_PRINT("[visual-dump] dumping %d image(s) x %zu chunk(s) to %s\n",
+                                  mVisualChunkDumpMaxSamples, chunkPaths.size(), mVisualChunkDumpDir.c_str());
+                    }
                 }
 #endif
             } else if (mConfig->visual_npu_layers() > 0) {
@@ -1190,6 +1276,52 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                                   varShapeString(chunkIn[1]).c_str(),
                                   varShapeString(chunkIn[2]).c_str());
                     }
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+                    if (!mVisualChunkDumpDir.empty() && mVisualChunkDumpedSamples < mVisualChunkDumpMaxSamples) {
+                        const size_t sampleIdx = static_cast<size_t>(mVisualChunkDumpedSamples);
+                        const char* keys[3] = {"hidden_states_in", "rotary_pos_emb", "attention_mask"};
+                        std::ostringstream meta;
+                        meta << "{\n"
+                             << "  \"chunk\": " << i << ",\n"
+                             << "  \"sample\": " << sampleIdx << ",\n"
+                             << "  \"inputs\": {\n";
+                        bool anyOk = false;
+                        for (int k = 0; k < 3; ++k) {
+                            VARP v = chunkIn[k];
+                            if (k == 1) {
+                                v = Express::_Squeeze(v, std::vector<int>{1});
+                            }
+                            std::vector<int> shape;
+                            std::string base = mVisualChunkDumpDir + "/" + std::string(keys[k])
+                                + "_chunk" + std::to_string(i) + "_sample" + std::to_string(sampleIdx);
+                            bool ok = visualChunkDumpVarp(base, v, shape);
+                            anyOk = anyOk || ok;
+                            meta << "    \"" << keys[k] << "\": {"
+                                 << "\"file\": \"" << keys[k] << "_chunk" << i
+                                 << "_sample" << sampleIdx << ".bin\", "
+                                 << "\"shape\": [";
+                            for (size_t d = 0; d < shape.size(); ++d) {
+                                meta << (d == 0 ? "" : ", ") << shape[d];
+                            }
+                            meta << "], \"ok\": " << (ok ? "true" : "false") << "}";
+                            if (k + 1 < 3) {
+                                meta << ",";
+                            }
+                            meta << "\n";
+                        }
+                        meta << "  }\n}\n";
+                        std::string metaPath = mVisualChunkDumpDir + "/meta_chunk" + std::to_string(i)
+                            + "_sample" + std::to_string(sampleIdx) + ".json";
+                        std::ofstream mj(metaPath, std::ios::trunc);
+                        if (mj.is_open()) {
+                            mj << meta.str();
+                        }
+                        if (anyOk) {
+                            MNN_PRINT("[visual-dump] chunk[%zu] sample[%zu] -> %s\n",
+                                      i, sampleIdx, mVisualChunkDumpDir.c_str());
+                        }
+                    }
+#endif
                     auto chunkOut = mVisionBlocksChunkModules[i]->onForward(chunkIn);
                     if (chunkOut.empty()) {
                         MNN_ERROR("visual_blocks chunk[%zu]: empty output\n", i);
@@ -1226,6 +1358,16 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
                 }
 #endif
             }
+#ifdef MNN_VISUAL_CHUNK_INPUT_DUMP
+            if (!mVisualChunkDumpDir.empty() && mVisualChunkDumpedSamples < mVisualChunkDumpMaxSamples) {
+                mVisualChunkDumpedSamples++;
+                MNN_PRINT("[visual-dump] image %d/%d done\n",
+                          mVisualChunkDumpedSamples, mVisualChunkDumpMaxSamples);
+                if (mVisualChunkDumpedSamples >= mVisualChunkDumpMaxSamples) {
+                    MNN_PRINT("[visual-dump] reached target sample count, subsequent images will not be dumped\n");
+                }
+            }
+#endif
             blocksOut.reserve(1 + allDeepstack.size());
             blocksOut.push_back(curHidden);
             for (auto& d : allDeepstack) blocksOut.push_back(d);

@@ -1,0 +1,8 @@
+*.pth
+*.onnx
+*.onnx.pb
+*.pb
+*.om
+*.omc
+model*
+*npz

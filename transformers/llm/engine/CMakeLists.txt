@@ -44,6 +44,9 @@ else()
 endif()
 # jinja.cpp template engine (always enabled, header-only)
 target_compile_definitions(llm PRIVATE LLM_USE_JINJA)
+if (MNN_VISUAL_CHUNK_INPUT_DUMP)
+    target_compile_definitions(llm PRIVATE MNN_VISUAL_CHUNK_INPUT_DUMP=1)
+endif()
 
 # Option to store MNN_PRINT/MNN_ERROR output into a string buffer.
 # Only enabled on Android. Pass -DLLM_LOG_TO_STRING=ON at cmake configure time.
