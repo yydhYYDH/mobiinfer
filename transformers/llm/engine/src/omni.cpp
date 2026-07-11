@@ -1858,10 +1858,8 @@ void Omni::addPositionIds(int t, int h, int w) {
                 }
             }
         }
-        // Match Qwen3-VL MRoPE: after a vision segment, continue from
-        // start + max(llm_grid_h, llm_grid_w), not from the last W index.
-        int next_idx = cur_idx + std::max(h, w);
-        mPositionIds.push_back(next_idx, next_idx, next_idx);
+        // Keep the vision-end token position aligned with existing Qwen3-VL exports.
+        mPositionIds.push_back();
     }
 }
 
