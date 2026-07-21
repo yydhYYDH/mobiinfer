@@ -166,6 +166,7 @@ public:
     virtual Express::VARP embedding(const std::vector<int>& input_ids) override;
     virtual Express::VARP gen_position_ids(int seq_len) override;
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1) override;
+    virtual void trimMultiModalPositionIds(size_t prefix_len) override;
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) override;
     virtual void generateWavform() override;
     // some models preprocess function
@@ -232,6 +233,7 @@ private:
     // m_rope position ids
     void addPositionIds(int t, int h = -1, int w = -1);
     MropeInfo mPositionIds;
+    int mPositionIdsOffset = 0;
 };
 
 }

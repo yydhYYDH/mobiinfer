@@ -2013,6 +2013,7 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
     std::smatch match;
     std::vector<int> ids{};
     mPositionIds.clear();
+    mPositionIdsOffset = 0;
 
     while (std::regex_search(searchStart, prompt.cend(), match, multimode_regex)) {
         auto txt_ids = mTokenizer->encode(match.prefix().str());
@@ -2044,6 +2045,26 @@ std::vector<int> Omni::tokenizer_encode(const std::string& prompt) {
     MultimodalPrompt multimodal_input;
     multimodal_input.prompt_template = prompt;
     return tokenizer_encode(multimodal_input);
+}
+
+void Omni::trimMultiModalPositionIds(size_t prefix_len) {
+    if (prefix_len == 0) {
+        return;
+    }
+    mPositionIdsOffset = static_cast<int>(prefix_len);
+    auto trimVec = [prefix_len](std::vector<int>& values) {
+        if (prefix_len >= values.size()) {
+            values.clear();
+        } else {
+            values.erase(values.begin(), values.begin() + prefix_len);
+            for (auto& value : values) {
+                value -= static_cast<int>(prefix_len);
+            }
+        }
+    };
+    trimVec(mPositionIds.mT);
+    trimVec(mPositionIds.mH);
+    trimVec(mPositionIds.mW);
 }
 
 std::vector<int> Omni::processImageContent(const std::string& content, const std::map<std::string, PromptImagePart>& images) {
@@ -2271,7 +2292,7 @@ VARP Omni::gen_position_ids(int seq_len) {
     if (mContext->gen_seq_len > 0) {
         for (int i=0; i<seq_len; ++i) {
             // auto pos = mContext->gen_seq_len + mPositionIds.back() + i;
-            auto pos = mContext->gen_seq_len + mPositionIds.back() + i;
+            auto pos = mContext->gen_seq_len + mPositionIdsOffset + mPositionIds.back() + i;
             ptr[i + 0] = pos;
             ptr[i + seq_len] = pos;
             ptr[i + seq_len * 2] = pos;

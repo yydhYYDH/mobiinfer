@@ -196,6 +196,7 @@ public:
     virtual std::vector<int> tokenizer_encode(const std::string& query);
     friend class Pipeline;
     virtual std::vector<int> tokenizer_encode(const MultimodalPrompt& multimodal_input);
+    virtual void trimMultiModalPositionIds(size_t prefix_len) {}
     // ptompt functions
     std::string apply_chat_template(const std::string& user_content) const;
     std::string apply_chat_template(const ChatMessages& chat_prompts) const;

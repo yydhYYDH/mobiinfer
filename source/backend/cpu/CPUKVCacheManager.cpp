@@ -347,7 +347,9 @@ void CPUKVCacheManager::onAlloc(KVMeta* meta, int seq_len) {
         }
 
         // Update mMaxLength first, then setFlashAttentionUpperKv to avoid division by zero
-        int kv_seq_len = meta->add + meta->seqlen_in_disk;
+        // In VL/QNN paths meta->add can be 0; seq_len is the actual variable
+        // length that will be appended after the restored prefix.
+        int kv_seq_len = seq_len + meta->seqlen_in_disk;
         mMaxLength = kv_seq_len > oldMaxLength ? kv_seq_len + mConfig.mExpandChunk : oldMaxLength;
         if (mUseFlashAttention) {
             setFlashAttentionUpperKv(MNN_FLASH_ATTENTION_BLOCK_SIZE);
@@ -459,8 +461,20 @@ void CPUKVCacheManager::onAlloc(KVMeta* meta, int seq_len) {
         createKVCacheFile(keyStoredDst, valueStoredDst);
         resetKVCacheFileSize(keySize, valueSize);
         mmapKVCache(keySize, valueSize);
-        mKVCacheInDisk = true;
-    } else { // store kv in memory
+        if (mKeyCacheFD != INVALID_FILE && mValueCacheFD != INVALID_FILE && mMapKeyAddr != nullptr && mMapValueAddr != nullptr) {
+            mKVCacheInDisk = true;
+        } else {
+            MNN_ERROR("Failed to allocate disk kvcache, fallback to memory kvcache. keySize=%zu valueSize=%zu kvHead=%d headDim=%d maxLen=%d\n",
+                      keySize, valueSize, mKvNumHead, mHeadDim, mMaxLength);
+            unmapKVCache(keySize, valueSize);
+            removeKVCacheFile();
+            mKVCacheInDisk = false;
+            if (sharePrefixKv) {
+                mSaveShareKvPrefix = false;
+            }
+        }
+    }
+    if (!mKVCacheInDisk) { // store kv in memory
         mPastKey.reset(Tensor::createDevice<int8_t>({mKvNumHead, (int)mCurrentKeySizePerHead}));
         mPastValue.reset(Tensor::createDevice<int8_t>({mKvNumHead, (int)mCurrentValueSizePerHead}));
 

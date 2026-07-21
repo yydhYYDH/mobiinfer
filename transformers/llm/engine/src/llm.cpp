@@ -277,6 +277,9 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     }
     std::string tmpPath = mConfig->tmp_path();
     if (mConfig->kvcache_mmap()) {
+        if (!tmpPath.empty()) {
+            MNNCreateDir(tmpPath.c_str());
+        }
         rtg->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_PATH_KVCACHE_DIR);
     }
     auto cachePath = mConfig->prefix_cache_path();
@@ -796,6 +799,10 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
         }
     }
 #endif
+    if (mMeta->file_flag == KVMeta::PendingRead && mMeta->seqlen_in_disk > 0) {
+        mMeta->previous += mMeta->seqlen_in_disk;
+        mMeta->seqlen_in_disk = 0;
+    }
     mMeta->sync();
     return outputs;
 }

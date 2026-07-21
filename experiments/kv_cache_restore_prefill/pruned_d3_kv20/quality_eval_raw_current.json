@@ -1,0 +1,359 @@
+{
+  "summary": {
+    "count": 20,
+    "gold_json_ok_rate": 1.0,
+    "pred_json_ok_rate": 1.0,
+    "both_json_ok_rate": 1.0,
+    "action_match_rate": 0.85,
+    "coord_comparable_count": 15,
+    "avg_coord_overlap": 0.5753867763219346,
+    "avg_prefix_chars": 38.25
+  },
+  "rows": [
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_00.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_00.log",
+      "prefix_chars": 22,
+      "gold_len": 205,
+      "pred_len": 181,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.5947136563876652,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_01.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_01.log",
+      "prefix_chars": 19,
+      "gold_len": 155,
+      "pred_len": 176,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "done",
+      "pred_action": "click",
+      "action_match": false,
+      "coord_overlap": null,
+      "coord_fields": null
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_02.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_02.log",
+      "prefix_chars": 17,
+      "gold_len": 216,
+      "pred_len": 209,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "swipe",
+      "pred_action": "swipe",
+      "action_match": true,
+      "coord_overlap": 1.0,
+      "coord_fields": [
+        "start_coords/end_coords",
+        "start_coords/end_coords"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_03.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_03.log",
+      "prefix_chars": 17,
+      "gold_len": 188,
+      "pred_len": 207,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "swipe",
+      "pred_action": "swipe",
+      "action_match": true,
+      "coord_overlap": 0.6240609345641952,
+      "coord_fields": [
+        "start_coords/end_coords",
+        "start_coords/end_coords"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_04.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_04.log",
+      "prefix_chars": 37,
+      "gold_len": 200,
+      "pred_len": 220,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "swipe",
+      "pred_action": "click",
+      "action_match": false,
+      "coord_overlap": null,
+      "coord_fields": null
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_05.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_05.log",
+      "prefix_chars": 18,
+      "gold_len": 197,
+      "pred_len": 187,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.8629717783066984,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_06.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_06.log",
+      "prefix_chars": 15,
+      "gold_len": 215,
+      "pred_len": 198,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click_input",
+      "pred_action": "click",
+      "action_match": false,
+      "coord_overlap": null,
+      "coord_fields": null
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_07.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_07.log",
+      "prefix_chars": 19,
+      "gold_len": 127,
+      "pred_len": 135,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "done",
+      "pred_action": "done",
+      "action_match": true,
+      "coord_overlap": null,
+      "coord_fields": null
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_08.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_08.log",
+      "prefix_chars": 47,
+      "gold_len": 199,
+      "pred_len": 215,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.4533333333333333,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_09.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_09.log",
+      "prefix_chars": 126,
+      "gold_len": 144,
+      "pred_len": 144,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.23676470588235293,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_10.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_10.log",
+      "prefix_chars": 144,
+      "gold_len": 165,
+      "pred_len": 165,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.0,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_11.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_11.log",
+      "prefix_chars": 25,
+      "gold_len": 198,
+      "pred_len": 175,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.0,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_12.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_12.log",
+      "prefix_chars": 15,
+      "gold_len": 191,
+      "pred_len": 170,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.6344223398430371,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_13.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_13.log",
+      "prefix_chars": 16,
+      "gold_len": 164,
+      "pred_len": 182,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "swipe",
+      "pred_action": "swipe",
+      "action_match": true,
+      "coord_overlap": 1.0,
+      "coord_fields": [
+        "start_coords/end_coords",
+        "start_coords/end_coords"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_14.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_14.log",
+      "prefix_chars": 24,
+      "gold_len": 202,
+      "pred_len": 212,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.6535319557904854,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_15.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_15.log",
+      "prefix_chars": 19,
+      "gold_len": 190,
+      "pred_len": 120,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "done",
+      "pred_action": "done",
+      "action_match": true,
+      "coord_overlap": null,
+      "coord_fields": null
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_16.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_16.log",
+      "prefix_chars": 32,
+      "gold_len": 210,
+      "pred_len": 230,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.9642857142857143,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_17.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_17.log",
+      "prefix_chars": 123,
+      "gold_len": 143,
+      "pred_len": 144,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.0,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_18.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_18.log",
+      "prefix_chars": 15,
+      "gold_len": 187,
+      "pred_len": 158,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 1.0,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    },
+    {
+      "gold": "artifacts/lookahead_bench/calib20k_100/gold/gold_19.txt",
+      "pred": "experiments/kv_cache_restore_prefill/pruned_d3_kv20/logs_raw_current/case_19.log",
+      "prefix_chars": 15,
+      "gold_len": 165,
+      "pred_len": 201,
+      "gold_json_ok": true,
+      "pred_json_ok": true,
+      "both_json_ok": true,
+      "gold_action": "click",
+      "pred_action": "click",
+      "action_match": true,
+      "coord_overlap": 0.6067172264355363,
+      "coord_fields": [
+        "bbox",
+        "bbox"
+      ]
+    }
+  ]
+}

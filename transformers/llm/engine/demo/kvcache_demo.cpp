@@ -23,6 +23,40 @@ static std::vector<int> encode_raw_prompt(Llm* llm, const std::string& prompt) {
     return llm->tokenizer_encode(prompt);
 }
 
+static bool starts_with_tokens(const std::vector<int>& values, const std::vector<int>& prefix) {
+    if (values.size() < prefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (values[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool encode_prefix_only(Llm* llm, const std::string& prefix, std::vector<int>* prefix_ids) {
+    auto encoded_prefix = encode_raw_prompt(llm, prefix);
+    if (encoded_prefix.empty()) {
+        return false;
+    }
+    prefix_ids->swap(encoded_prefix);
+    return true;
+}
+
+static bool encode_variable_after_prefix(Llm* llm, const std::string& prefix, const std::string& variable,
+                                         const std::vector<int>& prefix_ids, std::vector<int>* variable_ids) {
+    auto encoded_full = encode_raw_prompt(llm, prefix + variable);
+    if (!starts_with_tokens(encoded_full, prefix_ids)) {
+        MNN_ERROR("Full prompt token ids do not start with prefix token ids.\n");
+        return false;
+    }
+    auto prefix_len = prefix_ids.size();
+    variable_ids->assign(encoded_full.begin() + prefix_len, encoded_full.end());
+    llm->trimMultiModalPositionIds(prefix_len);
+    return !variable_ids->empty();
+}
+
 static int dump_kvcache(Llm* llm, const std::string& cache_name, const std::string& prompt_file) {
     auto prompt = read_prompt_file(prompt_file);
     if (prompt.empty()) {
@@ -93,10 +127,17 @@ static int load_prefix_step(Llm* llm, const std::string& cache_name, const std::
         MNN_ERROR("Variable file is empty: %s\n", variable_file.c_str());
         return 1;
     }
-    auto prefix_ids = encode_raw_prompt(llm, prefix);
-    auto variable_ids = encode_raw_prompt(llm, variable);
-    if (prefix_ids.empty() || variable_ids.empty()) {
-        MNN_ERROR("Prefix or variable encodes to empty token list.\n");
+    std::vector<int> prefix_ids;
+    if (!encode_prefix_only(llm, prefix, &prefix_ids)) {
+        MNN_ERROR("Prefix encodes to empty token list.\n");
+        return 1;
+    }
+    // Multimodal tokenization runs the vision encoder. Finish it before
+    // PendingRead is installed so processor attention cannot consume the
+    // language model's prefix-cache metadata.
+    std::vector<int> variable_ids;
+    if (!encode_variable_after_prefix(llm, prefix, variable, prefix_ids, &variable_ids)) {
+        MNN_ERROR("Variable encodes to empty token list.\n");
         return 1;
     }
 
@@ -136,16 +177,20 @@ static int split_step(Llm* llm, const std::string& prefix_file, const std::strin
         MNN_ERROR("Variable file is empty: %s\n", variable_file.c_str());
         return 1;
     }
-    auto prefix_ids = encode_raw_prompt(llm, prefix);
-    auto variable_ids = encode_raw_prompt(llm, variable);
-    if (prefix_ids.empty() || variable_ids.empty()) {
-        MNN_ERROR("Prefix or variable encodes to empty token list.\n");
+    std::vector<int> prefix_ids;
+    if (!encode_prefix_only(llm, prefix, &prefix_ids)) {
+        MNN_ERROR("Prefix encodes to empty token list.\n");
         return 1;
     }
 
     std::ostringstream answer;
     llm->generate_init(&answer, "\n");
     llm->generate(prefix_ids, 0);
+    std::vector<int> variable_ids;
+    if (!encode_variable_after_prefix(llm, prefix, variable, prefix_ids, &variable_ids)) {
+        MNN_ERROR("Variable encodes to empty token list.\n");
+        return 1;
+    }
     llm->generate(variable_ids, max_token_number);
     auto context = llm->getContext();
     if (context->status == LlmStatus::INTERNAL_ERROR) {
@@ -178,14 +223,11 @@ static int raw_generate(Llm* llm, const std::string& prompt_file, int max_token_
 
     std::ostringstream answer;
     llm->generate_init(&answer, "\n");
-    llm->generate(input_ids, 0);
+    llm->generate(input_ids, max_token_number);
     auto context = llm->getContext();
-    while (!llm->stoped() && context->gen_seq_len < max_token_number) {
-        llm->generate(1);
-        if (context->status == LlmStatus::INTERNAL_ERROR) {
-            MNN_ERROR("Error: Generation failed due to internal error\n");
-            return 1;
-        }
+    if (context->status == LlmStatus::INTERNAL_ERROR) {
+        MNN_ERROR("Error: Generation failed due to internal error\n");
+        return 1;
     }
 
     MNN_PRINT("%s", answer.str().c_str());

@@ -1,0 +1,4 @@
+You are a helpful assistant. Please answer the user's question carefully and concisely.
+
+Context:
+Mobile UI automation tasks require identifying the intended action from the user's instruction and the current screen state.

@@ -1,0 +1,5 @@
+
+User task:
+The screen shows sound mode options: vibrate, ring, and silent. Set the phone to silent mode.
+
+Answer:
