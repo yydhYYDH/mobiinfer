@@ -876,6 +876,13 @@ void LookaheadGeneration::generate(GenerationParams& param) {
     if (len >= max_token) {
         mContext->status = LlmStatus::MAX_TOKENS_FINISHED;
     }
+    mContext->lookahead_steps += statSteps;
+    mContext->lookahead_spec_steps += statSpecSteps;
+    mContext->lookahead_ar_steps += statArSteps;
+    mContext->lookahead_draft_tokens += statDraftTokens;
+    mContext->lookahead_accepted_draft_tokens += statAcceptedDraftTokens;
+    mContext->lookahead_full_accept_steps += statFullAcceptSteps;
+    mContext->lookahead_accepted_tokens += statAcceptedTokens;
     if (debugStats) {
         float specStepRate = statSteps > 0 ? 100.0f * statSpecSteps / statSteps : 0.0f;
         float draftAcceptRate = statDraftTokens > 0 ? 100.0f * statAcceptedDraftTokens / statDraftTokens : 0.0f;

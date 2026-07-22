@@ -119,6 +119,14 @@ struct LlmContext {
     int64_t ttfa_us = 0;
     float pixels_mp = 0;
     float audio_input_s = 0;
+    // Lookahead speculative decoding stats, accumulated for the current response.
+    int lookahead_steps = 0;
+    int lookahead_spec_steps = 0;
+    int lookahead_ar_steps = 0;
+    int lookahead_draft_tokens = 0;
+    int lookahead_accepted_draft_tokens = 0;
+    int lookahead_full_accept_steps = 0;
+    int lookahead_accepted_tokens = 0;
     // tokens
     int current_token;
     std::vector<int> history_tokens;

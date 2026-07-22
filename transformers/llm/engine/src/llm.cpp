@@ -1100,6 +1100,13 @@ void Llm::generate_init(std::ostream* os, const char* end_with) {
     mContext->decode_us   = 0;
     mContext->current_token = -1;
     mContext->sample_us = 0;
+    mContext->lookahead_steps = 0;
+    mContext->lookahead_spec_steps = 0;
+    mContext->lookahead_ar_steps = 0;
+    mContext->lookahead_draft_tokens = 0;
+    mContext->lookahead_accepted_draft_tokens = 0;
+    mContext->lookahead_full_accept_steps = 0;
+    mContext->lookahead_accepted_tokens = 0;
     if (!mConfig->reuse_kv()) {
         mContext->all_seq_len = 0;
         mContext->history_tokens.clear();
