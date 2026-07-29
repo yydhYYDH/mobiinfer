@@ -603,6 +603,9 @@ int main(int argc, const char* argv[]) {
     bool ok = false;
     if (mode == "raw" || mode == "raw-ar") {
         llm->set_config(R"({"reuse_kv":false,"use_template":false})");
+        if (mode == "raw") {
+            llm->set_config(R"({"lookahead_debug_stats":true,"lookahead_debug_stats_detail":false})");
+        }
         ok = run_raw(llm.get(), bench_root, rows, max_new_tokens, &stats);
     } else if (mode == "cached-history") {
         llm->set_config(R"({"reuse_kv":true,"use_template":false})");

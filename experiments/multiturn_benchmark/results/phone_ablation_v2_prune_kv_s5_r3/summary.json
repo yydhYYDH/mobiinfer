@@ -1,0 +1,29 @@
+{
+  "runs": 3,
+  "groups": [
+    {
+      "variant": "prune_kv",
+      "step_length": 5,
+      "runs": 3,
+      "median_logical_prompt_tokens": 8942,
+      "median_actual_prefill_tokens": 3768,
+      "median_decode_tokens": 1169,
+      "median_tokenize_time_s": 24.137,
+      "median_vision_time_s": 23.9398,
+      "median_prefill_time_s": 37.9964,
+      "median_decode_time_s": 49.7919,
+      "median_wall_generate_time_s": 88.0282,
+      "median_e2e_time_s": 112.1652,
+      "median_effective_prefill_speed": 235.34,
+      "median_actual_prefill_speed": 99.17,
+      "median_decode_speed": 23.48,
+      "median_prefill_token_reduction": 0.5786,
+      "median_draft_accept_rate_pct": 0.0,
+      "median_full_accept_rate_pct": 0.0,
+      "median_format_rate": 1.0,
+      "median_clean_json_rate": 1.0,
+      "median_gold_action_match_rate": 1.0
+    }
+  ],
+  "comparisons": []
+}

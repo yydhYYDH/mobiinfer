@@ -1,0 +1,25 @@
+{
+  "variants": [
+    "baseline",
+    "kv_only",
+    "prune_only",
+    "prune_kv",
+    "prune_d3",
+    "full"
+  ],
+  "step_lengths": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "trajectory_ids": [
+    "012",
+    "019"
+  ],
+  "tasks": 2,
+  "repeats": 1,
+  "cooldown_seconds": 10.0,
+  "seed": 20260722
+}

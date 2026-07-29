@@ -1,0 +1,5 @@
+platform,variant,repeats,peak_rss_median_mib,peak_rss_min_mib,peak_rss_max_mib,peak_pss_median_mib,peak_pss_min_mib,peak_pss_max_mib,peak_uss_median_mib,peak_uss_min_mib,peak_uss_max_mib,peak_swap_pss_mib
+server,baseline,3,3986.82,3986.79,3986.86,3983.15,3983.12,3983.19,3983.12,3983.08,3983.15,0.00
+server,full,3,2800.80,2799.91,2801.47,2797.40,2796.97,2797.70,2797.37,2796.93,2797.66,0.00
+phone,baseline,3,3879.19,3878.70,3879.38,3769.98,3691.82,3859.23,3767.05,3688.90,3856.31,0.00
+phone,full,3,2626.07,2625.78,2626.43,2570.26,2570.24,2578.77,2567.36,2567.30,2575.80,0.00
